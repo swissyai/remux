@@ -16,8 +16,9 @@ use supervisor::attach::{
     consume_authorization, record_authorization, spawn_authorized_pty, AttachScope,
 };
 use supervisor::protocol::{parse_message, unix_micros_now, Control, Event, EventKind, Message};
+use supervisor::restore::inspect_passive;
 use supervisor::scrollback::ScrollbackWriter;
-use supervisor::state::{dump_atomic, restore_passive, LiveState};
+use supervisor::state::{dump_atomic, LiveState};
 
 const MAX_MESSAGE_BYTES: usize = 4_096;
 const MAX_BATCH_MESSAGES: usize = 256;
@@ -237,12 +238,7 @@ fn request_dump(config: DumpConfig) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn inspect_restore(config: RestoreConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let state = restore_passive(&config.state_file)?;
-    println!(
-        "restored passive layout: {} sessions, policy {}",
-        state.sessions.len(),
-        state.restore_policy
-    );
+    println!("{}", inspect_passive(&config.state_file)?);
     Ok(())
 }
 

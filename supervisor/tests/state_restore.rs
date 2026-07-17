@@ -105,7 +105,10 @@ fn restore_rejects_hostile_attach_fields_without_execution_capability() {
         !sentinel.exists(),
         "restore must never execute persisted text"
     );
-    let restore_source = include_str!("../src/state.rs");
+    let restore_sources = [
+        include_str!("../src/state.rs"),
+        include_str!("../src/restore.rs"),
+    ];
     for forbidden in [
         "std::process::Command",
         "Command::new",
@@ -115,7 +118,9 @@ fn restore_rejects_hostile_attach_fields_without_execution_capability() {
         "consume_authorization",
     ] {
         assert!(
-            !restore_source.contains(forbidden),
+            restore_sources
+                .iter()
+                .all(|source| !source.contains(forbidden)),
             "restore module must not hold process capability: {forbidden}"
         );
     }

@@ -8,5 +8,6 @@ pub mod attach;
 mod json;
 pub mod protocol;
 mod pty;
+pub mod restore;
 pub mod scrollback;
 pub mod state;

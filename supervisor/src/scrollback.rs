@@ -32,7 +32,10 @@ impl ScrollbackWriter {
         for session_id in session_ids {
             let session_id = session_id.into();
             let path = directory.join(segment_file_name(&session_id));
-            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            let file = OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(path)?;
             if files.insert(session_id.clone(), file).is_some() {
                 return Err(invalid_data("duplicate scrollback session"));
             }

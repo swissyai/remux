@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "run_id": "run-1784303507-16346",
-  "generated_unix_seconds": 1784303507,
+  "run_id": "run-1784303768-18050",
+  "generated_unix_seconds": 1784303768,
   "machine": {"os": "macos 15.6.1", "architecture": "aarch64", "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)"},
   "config": {"sessions": 20, "events_per_session": 6, "rate": 20, "fork_hold_ms": 360, "fork_cpu_ms": 30, "fork_rss_mib": 18},
   "results": [
@@ -11,14 +11,14 @@
       "events": 120,
       "processes_spawned": 120,
       "per_event_forks": 120,
-      "peak_rss_bytes": 243924992,
-      "events_per_second": 18.831081,
-      "latency_us": {"p50": 427144, "p95": 528952, "p99": 613101},
+      "peak_rss_bytes": 223117312,
+      "events_per_second": 18.623396,
+      "latency_us": {"p50": 447816, "p95": 525151, "p99": 540647},
       "cpu_seconds": 3.600000,
       "cpu_source": "configured-by-construction (events × --fork-cpu-ms)",
-      "wall_seconds": 6.372443,
+      "wall_seconds": 6.443508,
       "reproduce": "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
-      "interpretation": "Distinct-PID sampling measured 120 event workers; p50 completion was 427.1ms versus the configured 360ms hold."
+      "interpretation": "Distinct-PID sampling measured 120 event workers; p50 completion was 447.8ms versus the configured 360ms hold."
     },
     {
       "model": "scripted_socket_supervisor",
@@ -26,14 +26,14 @@
       "events": 120,
       "processes_spawned": 21,
       "per_event_forks": 0,
-      "peak_rss_bytes": 39714816,
-      "events_per_second": 18.863304,
-      "latency_us": {"p50": 72, "p95": 255, "p99": 529},
-      "cpu_seconds": 0.030000,
+      "peak_rss_bytes": 39223296,
+      "events_per_second": 18.960276,
+      "latency_us": {"p50": 82, "p95": 225, "p99": 350},
+      "cpu_seconds": 0.040000,
       "cpu_source": "sampled cumulative process-tree CPU via ps",
-      "wall_seconds": 6.361558,
+      "wall_seconds": 6.329022,
       "reproduce": "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
-      "interpretation": "20 attached PTY sessions ingested 120 events through one socket; distinct-PID sampling found 21 processes and 0 event forks at 37.88MiB peak RSS."
+      "interpretation": "20 attached PTY sessions ingested 120 events through one socket; distinct-PID sampling found 21 processes and 0 event forks at 37.41MiB peak RSS."
     },
     {
       "model": "real_shell_socket_supervisor",
@@ -41,14 +41,14 @@
       "events": 120,
       "processes_spawned": 21,
       "per_event_forks": 0,
-      "peak_rss_bytes": 58900480,
-      "events_per_second": 19.707971,
-      "latency_us": {"p50": 43, "p95": 161, "p99": 264},
-      "cpu_seconds": 0.060000,
+      "peak_rss_bytes": 61308928,
+      "events_per_second": 18.946874,
+      "latency_us": {"p50": 50, "p95": 184, "p99": 3954},
+      "cpu_seconds": 0.070000,
       "cpu_source": "sampled cumulative process-tree CPU via ps",
-      "wall_seconds": 6.088907,
+      "wall_seconds": 6.333498,
       "reproduce": "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
-      "interpretation": "20 attached PTY sessions ingested 120 events through one socket; distinct-PID sampling found 21 processes and 0 event forks at 56.17MiB peak RSS."
+      "interpretation": "20 attached PTY sessions ingested 120 events through one socket; distinct-PID sampling found 21 processes and 0 event forks at 58.47MiB peak RSS."
     }
   ]
 }
