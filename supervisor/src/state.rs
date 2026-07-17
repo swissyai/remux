@@ -1,9 +1,8 @@
-// Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
 //! Bounded live state and passive persistence schema.
 //!
-//! Contract: persistence contains layout, event metadata, status, and bounded
-//! scrollback only. Restore is data reconstruction: this module deliberately has no
-//! process-spawn API, command field, callback, or executable extension point.
+//! Contract: persistence contains layout, event metadata, scrollback segment
+//! pointers, and bounded tails only. Restore is data reconstruction: this module has
+//! no process authority, command field, callback, or executable extension point.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -13,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::json::{self, Value};
 use crate::protocol::{Event, EventKind};
 
-const SCHEMA_VERSION: u64 = 1;
+const SCHEMA_VERSION: u64 = 2;
 const SCROLLBACK_TAIL_LINES: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -28,6 +27,15 @@ struct LiveSession {
     last_event: Option<PersistedEvent>,
     scrollback_tail: VecDeque<String>,
     next_scrollback_offset: u64,
+    persisted_scrollback_offset: u64,
+    segments_file: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingScrollback {
+    pub session_id: String,
+    pub offset: u64,
+    pub payload: String,
 }
 
 impl LiveState {
@@ -46,6 +54,8 @@ impl LiveState {
                 last_event: None,
                 scrollback_tail: VecDeque::with_capacity(SCROLLBACK_TAIL_LINES),
                 next_scrollback_offset: 0,
+                persisted_scrollback_offset: 0,
+                segments_file: segment_file_name(&session_id),
             };
             if sessions.insert(session_id.clone(), session).is_some() {
                 return Err(invalid_data("duplicate session id"));
@@ -58,7 +68,8 @@ impl LiveState {
         })
     }
 
-    pub fn apply_batch(&mut self, events: &[Event]) -> io::Result<()> {
+    pub fn apply_batch(&mut self, events: &[Event]) -> io::Result<Vec<PendingScrollback>> {
+        let mut pending = Vec::new();
         for event in events {
             let session = self
                 .sessions
@@ -72,14 +83,19 @@ impl LiveState {
             match event.kind {
                 EventKind::Status => session.status.clone_from(&event.payload),
                 EventKind::Output => {
+                    let offset = session.next_scrollback_offset;
                     if session.scrollback_tail.len() == SCROLLBACK_TAIL_LINES {
                         session.scrollback_tail.pop_front();
                     }
                     session.scrollback_tail.push_back(event.payload.clone());
-                    session.next_scrollback_offset = session
-                        .next_scrollback_offset
+                    session.next_scrollback_offset = offset
                         .checked_add(1)
                         .ok_or_else(|| invalid_data("scrollback offset overflow"))?;
+                    pending.push(PendingScrollback {
+                        session_id: event.session_id.clone(),
+                        offset,
+                        payload: event.payload.clone(),
+                    });
                 }
                 EventKind::Tool => {}
             }
@@ -88,6 +104,27 @@ impl LiveState {
                 sent_unix_micros: event.sent_unix_micros,
                 kind: event.kind.as_str().to_owned(),
             });
+        }
+        Ok(pending)
+    }
+
+    pub fn mark_scrollback_persisted(
+        &mut self,
+        offsets: &BTreeMap<String, u64>,
+    ) -> io::Result<()> {
+        if offsets.len() != self.sessions.len() {
+            return Err(invalid_data("persisted scrollback session count differs"));
+        }
+        for (session_id, session) in &mut self.sessions {
+            let offset = offsets
+                .get(session_id)
+                .ok_or_else(|| invalid_data("persisted scrollback session missing"))?;
+            if *offset < session.persisted_scrollback_offset
+                || *offset > session.next_scrollback_offset
+            {
+                return Err(invalid_data("invalid persisted scrollback offset"));
+            }
+            session.persisted_scrollback_offset = *offset;
         }
         Ok(())
     }
@@ -104,6 +141,8 @@ impl LiveState {
                         status: session.status.clone(),
                         last_event: session.last_event.clone(),
                         scrollback: PersistedScrollback {
+                            segments_file: session.segments_file.clone(),
+                            persisted_through: session.persisted_scrollback_offset,
                             tail: session.scrollback_tail.iter().cloned().collect(),
                             next_offset: session.next_scrollback_offset,
                         },
@@ -153,6 +192,8 @@ pub struct PersistedEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedScrollback {
+    pub segments_file: String,
+    pub persisted_through: u64,
     pub tail: Vec<String>,
     pub next_offset: u64,
 }
@@ -227,7 +268,12 @@ fn encode_state(state: &PersistedState) -> String {
             )),
             None => output.push_str("null"),
         }
-        output.push_str(",\n      \"scrollback\": {\"tail\": [");
+        output.push_str(",\n      \"scrollback\": {");
+        output.push_str(&format!(
+            "\"segments_file\": {}, \"persisted_through\": {}, \"tail\": [",
+            json::quote(&session.scrollback.segments_file),
+            session.scrollback.persisted_through
+        ));
         for (tail_index, line) in session.scrollback.tail.iter().enumerate() {
             if tail_index > 0 {
                 output.push_str(", ");
@@ -339,7 +385,16 @@ fn decode_event(value: &Value) -> io::Result<PersistedEvent> {
 
 fn decode_scrollback(value: &Value) -> io::Result<PersistedScrollback> {
     let object = object(value, "scrollback")?;
-    exact_fields(object, &["tail", "next_offset"], "scrollback")?;
+    exact_fields(
+        object,
+        &[
+            "segments_file",
+            "persisted_through",
+            "tail",
+            "next_offset",
+        ],
+        "scrollback",
+    )?;
     let tail = array(field(object, "tail")?, "scrollback.tail")?
         .iter()
         .map(|value| string(value, "scrollback line").map(str::to_owned))
@@ -348,6 +403,15 @@ fn decode_scrollback(value: &Value) -> io::Result<PersistedScrollback> {
         return Err(invalid_data("persisted scrollback tail exceeds limit"));
     }
     Ok(PersistedScrollback {
+        segments_file: string(
+            field(object, "segments_file")?,
+            "scrollback.segments_file",
+        )?
+        .to_owned(),
+        persisted_through: number(
+            field(object, "persisted_through")?,
+            "scrollback.persisted_through",
+        )?,
         tail,
         next_offset: number(field(object, "next_offset")?, "scrollback.next_offset")?,
     })
@@ -365,6 +429,14 @@ fn validate_restored(layout: &PersistedLayout, sessions: &[PersistedSession]) ->
         }
         if session.status.is_empty() || !ids.insert(layout_id) {
             return Err(invalid_data("invalid restored session"));
+        }
+        if session.scrollback.segments_file != segment_file_name(&session.id) {
+            return Err(invalid_data("invalid scrollback segment pointer"));
+        }
+        if session.scrollback.persisted_through > session.scrollback.next_offset
+            || session.scrollback.tail.len() as u64 > session.scrollback.next_offset
+        {
+            return Err(invalid_data("invalid restored scrollback offsets"));
         }
     }
     Ok(())
@@ -431,6 +503,10 @@ fn validate_session_id(session_id: &str) -> io::Result<()> {
         return Err(invalid_data("invalid session id"));
     }
     Ok(())
+}
+
+fn segment_file_name(session_id: &str) -> String {
+    format!("{session_id}.segments")
 }
 
 fn temporary_path(path: &Path) -> io::Result<PathBuf> {
