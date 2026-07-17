@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "run_id": "run-1784254185-57038",
+  "generated_unix_seconds": 1784254185,
+  "machine": {"os": "macos 15.6.1", "architecture": "aarch64", "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)"},
+  "config": {"sessions": 20, "events_per_session": 6, "rate": 20, "fork_hold_ms": 360, "fork_cpu_ms": 30, "fork_rss_mib": 18},
+  "results": [
+    {
+      "model": "fork_per_event",
+      "sessions": 20,
+      "events": 120,
+      "processes_spawned": 120,
+      "per_event_forks": 120,
+      "peak_rss_bytes": 266403840,
+      "events_per_second": 18.832922,
+      "latency_us": {"p50": 466009, "p95": 535928, "p99": 663312},
+      "cpu_seconds": 3.600000,
+      "wall_seconds": 6.371821,
+      "reproduce": "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
+      "interpretation": "One process per event produced 120 forks; p50 completion was 466.0ms versus the configured 360ms hold."
+    },
+    {
+      "model": "socket_supervisor",
+      "sessions": 20,
+      "events": 120,
+      "processes_spawned": 21,
+      "per_event_forks": 0,
+      "peak_rss_bytes": 37355520,
+      "events_per_second": 18.225946,
+      "latency_us": {"p50": 68, "p95": 253, "p99": 491},
+      "cpu_seconds": 0.030000,
+      "wall_seconds": 6.584021,
+      "reproduce": "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
+      "interpretation": "20 PTY sessions ingested 120 events through one socket with zero per-event forks at 35.62MiB peak RSS."
+    }
+  ]
+}

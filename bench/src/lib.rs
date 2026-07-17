@@ -28,6 +28,7 @@ pub struct BenchmarkConfig {
     pub events_per_session: u64,
     pub rate: u64,
     pub fork_hold_ms: u64,
+    pub fork_cpu_ms: u64,
     pub fork_rss_mib: u64,
 }
 
@@ -110,7 +111,7 @@ pub fn render_markdown(report: &BenchmarkReport, json_path: &str) -> String {
 
 pub fn render_json(report: &BenchmarkReport) -> String {
     let mut output = format!(
-        "{{\n  \"schema_version\": 1,\n  \"run_id\": {},\n  \"generated_unix_seconds\": {},\n  \"machine\": {{\"os\": {}, \"architecture\": {}, \"rustc\": {}}},\n  \"config\": {{\"sessions\": {}, \"events_per_session\": {}, \"rate\": {}, \"fork_hold_ms\": {}, \"fork_rss_mib\": {}}},\n  \"results\": [\n",
+        "{{\n  \"schema_version\": 1,\n  \"run_id\": {},\n  \"generated_unix_seconds\": {},\n  \"machine\": {{\"os\": {}, \"architecture\": {}, \"rustc\": {}}},\n  \"config\": {{\"sessions\": {}, \"events_per_session\": {}, \"rate\": {}, \"fork_hold_ms\": {}, \"fork_cpu_ms\": {}, \"fork_rss_mib\": {}}},\n  \"results\": [\n",
         quote(&report.run_id),
         report.generated_unix_seconds,
         quote(&report.machine.os),
@@ -120,6 +121,7 @@ pub fn render_json(report: &BenchmarkReport) -> String {
         report.config.events_per_session,
         report.config.rate,
         report.config.fork_hold_ms,
+        report.config.fork_cpu_ms,
         report.config.fork_rss_mib
     );
     for (index, result) in report.results.iter().enumerate() {

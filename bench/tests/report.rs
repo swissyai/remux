@@ -53,6 +53,7 @@ fn every_report_row_carries_its_reproduction_command() {
             events_per_session: 6,
             rate: 20,
             fork_hold_ms: 360,
+            fork_cpu_ms: 30,
             fork_rss_mib: 18,
         },
         results: vec![result],

@@ -146,6 +146,8 @@ fn run_fork_baseline(
                 .args([
                     "--hold-ms",
                     &config.fork_hold_ms.to_string(),
+                    "--cpu-ms",
+                    &config.fork_cpu_ms.to_string(),
                     "--rss-mib",
                     &config.fork_rss_mib.to_string(),
                     "--kind",
@@ -432,6 +434,7 @@ struct Config {
     events_per_session: u64,
     rate: u64,
     fork_hold_ms: u64,
+    fork_cpu_ms: u64,
     fork_rss_mib: u64,
 }
 
@@ -442,6 +445,7 @@ impl Config {
             events_per_session: 6,
             rate: 20,
             fork_hold_ms: 360,
+            fork_cpu_ms: 30,
             fork_rss_mib: 18,
         };
         let mut arguments = arguments;
@@ -456,6 +460,7 @@ impl Config {
                 }
                 "--rate" => config.rate = parse_positive(&value, "rate")?,
                 "--fork-hold-ms" => config.fork_hold_ms = parse_positive(&value, "fork-hold-ms")?,
+                "--fork-cpu-ms" => config.fork_cpu_ms = parse_positive(&value, "fork-cpu-ms")?,
                 "--fork-rss-mib" => config.fork_rss_mib = parse_positive(&value, "fork-rss-mib")?,
                 _ => return Err(format!("unknown flag {flag}").into()),
             }
@@ -466,6 +471,9 @@ impl Config {
     fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self.sessions > 64 {
             return Err("sessions exceeds safety limit 64".into());
+        }
+        if self.fork_cpu_ms > self.fork_hold_ms {
+            return Err("fork-cpu-ms cannot exceed fork-hold-ms".into());
         }
         let concurrent_forks = self
             .rate
@@ -512,11 +520,12 @@ impl Config {
 
     fn reproduction_command(&self) -> String {
         format!(
-            "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions {} --events-per-session {} --rate {} --fork-hold-ms {} --fork-rss-mib {}",
+            "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions {} --events-per-session {} --rate {} --fork-hold-ms {} --fork-cpu-ms {} --fork-rss-mib {}",
             self.sessions,
             self.events_per_session,
             self.rate,
             self.fork_hold_ms,
+            self.fork_cpu_ms,
             self.fork_rss_mib
         )
     }
@@ -527,6 +536,7 @@ impl Config {
             events_per_session: self.events_per_session,
             rate: self.rate,
             fork_hold_ms: self.fork_hold_ms,
+            fork_cpu_ms: self.fork_cpu_ms,
             fork_rss_mib: self.fork_rss_mib,
         }
     }
