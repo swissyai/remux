@@ -12,6 +12,9 @@ we keep hitting in fleet work — fork storms, resident bloat, blind session aut
 with benchmarks built in throughout. The same treatment extends to the agent runner
 layer (pi): measure first, optimize what the receipts justify. End state: a working
 environment that improves against its own benchmarks, usable by us and anyone else.
+The full principles and their source studies (Devin Fusion economics, Replit
+self-driving company, AIDE2 RSI, memory/loop/locality protocol, Modal 1M-sandbox
+architecture) live in DOCTRINE.md — read it before designing any wave.
 
 ## Design goals
 
