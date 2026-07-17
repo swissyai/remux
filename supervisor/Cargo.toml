@@ -1,0 +1,18 @@
+[package]
+name = "supervisor"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+default-run = "remux-supervisor"
+
+[[bin]]
+name = "remux-supervisor"
+path = "src/bin/remux-supervisor.rs"
+
+[[bin]]
+name = "fake-agent"
+path = "src/bin/fake-agent.rs"
+
+[dependencies]
+# No third-party crates: the tracer uses only std and narrow system ABI calls.
