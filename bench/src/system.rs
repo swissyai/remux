@@ -62,17 +62,19 @@ pub fn descendants(entries: &[ProcessEntry], root_pid: u32) -> BTreeSet<u32> {
 pub struct ResourceTracker {
     peak_rss_kib: u64,
     cpu_by_pid: BTreeMap<u32, f64>,
+    observed_pids: BTreeSet<u32>,
 }
 
 impl ResourceTracker {
     pub fn observe(&mut self, entries: &[ProcessEntry], selected: &BTreeSet<u32>) {
-        let rss_kib = entries
+        let observed = entries
             .iter()
             .filter(|entry| selected.contains(&entry.pid))
-            .map(|entry| entry.rss_kib)
-            .sum();
+            .collect::<Vec<_>>();
+        let rss_kib = observed.iter().map(|entry| entry.rss_kib).sum();
         self.peak_rss_kib = self.peak_rss_kib.max(rss_kib);
-        for entry in entries.iter().filter(|entry| selected.contains(&entry.pid)) {
+        for entry in observed {
+            self.observed_pids.insert(entry.pid);
             self.cpu_by_pid
                 .entry(entry.pid)
                 .and_modify(|seconds| *seconds = seconds.max(entry.cpu_seconds))
@@ -86,6 +88,14 @@ impl ResourceTracker {
 
     pub fn cpu_seconds(&self) -> f64 {
         self.cpu_by_pid.values().sum()
+    }
+
+    pub fn observed_pids(&self) -> &BTreeSet<u32> {
+        &self.observed_pids
+    }
+
+    pub fn distinct_pid_count(&self) -> u64 {
+        u64::try_from(self.observed_pids.len()).unwrap_or(u64::MAX)
     }
 }
 

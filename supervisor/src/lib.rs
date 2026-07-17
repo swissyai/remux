@@ -4,7 +4,10 @@
 //! Contract: callers provide validated event messages; this crate updates bounded
 //! in-memory state and persists a passive schema that has no executable fields.
 
+pub mod attach;
 mod json;
 pub mod protocol;
-pub mod pty;
+mod pty;
+pub mod restore;
+pub mod scrollback;
 pub mod state;

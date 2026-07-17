@@ -58,8 +58,8 @@ fn scripted_event(sequence: u64) -> (EventKind, String) {
 }
 
 fn sleep_until(deadline: Instant) {
-    if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        thread::sleep(remaining);
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        thread::sleep(remaining.min(Duration::from_millis(100)));
     }
 }
 

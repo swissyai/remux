@@ -30,8 +30,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::hint::black_box(checksum.wrapping_mul(1_664_525).wrapping_add(1_013_904_223));
     }
     std::hint::black_box(checksum);
-    if let Some(remaining) = Duration::from_millis(config.hold_ms).checked_sub(started.elapsed()) {
-        thread::sleep(remaining);
+    let deadline = started
+        .checked_add(Duration::from_millis(config.hold_ms))
+        .ok_or("fork hold deadline overflow")?;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        thread::sleep(remaining.min(Duration::from_millis(100)));
     }
     Ok(())
 }
