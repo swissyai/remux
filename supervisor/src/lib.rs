@@ -6,4 +6,5 @@
 
 mod json;
 pub mod protocol;
+pub mod pty;
 pub mod state;
