@@ -43,6 +43,7 @@ pub struct ScenarioResult {
     pub events_per_second: f64,
     pub latency_us: Percentiles,
     pub cpu_seconds: f64,
+    pub cpu_source: String,
     pub wall_seconds: f64,
     pub command: String,
     pub interpretation: String,
@@ -75,7 +76,7 @@ fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
 
 pub fn render_markdown(report: &BenchmarkReport, json_path: &str) -> String {
     let mut output = format!(
-        "# W1 benchmark results\n\nMeasured on `{}` / `{}` with `{}` at Unix time `{}`. Machine-readable receipt: [`{}`]({}).\n\n",
+        "# W2 benchmark results\n\nMeasured on `{}` / `{}` with `{}` at Unix time `{}`. Machine-readable receipt: [`{}`]({}).\n\n",
         report.machine.os,
         report.machine.architecture,
         report.machine.rustc,
@@ -83,12 +84,12 @@ pub fn render_markdown(report: &BenchmarkReport, json_path: &str) -> String {
         json_path,
         json_path
     );
-    output.push_str("Peak RSS is the sampled sum for each subject process tree. CPU seconds are sampled cumulative subject CPU; harness/sampler processes are excluded. Latency is event creation-to-ingest for the supervisor and spawn-to-exit for fork-per-event.\n\n");
-    output.push_str("| Model | Sessions | Events | Processes spawned | Per-event forks | Peak RSS (MiB) | Events/s | p50 (ms) | p95 (ms) | p99 (ms) | CPU (s) | Wall (s) | Interpretation | Reproduce |\n");
-    output.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n");
+    output.push_str("Peak RSS and process counts come from repeated snapshots of each subject process tree; the count is the union of distinct observed PIDs. Harness/sampler processes are excluded. Supervisor CPU is sampled cumulative subject CPU. Fork-model CPU is configured-by-construction as events × `--fork-cpu-ms`, and is labeled separately below. Latency is event creation-to-ingest for socket scenarios and spawn-to-exit for fork-per-event.\n\n");
+    output.push_str("| Model | Sessions | Events | Distinct processes measured | Per-event forks measured | Peak RSS (MiB) | Events/s | p50 (ms) | p95 (ms) | p99 (ms) | CPU (s) | CPU provenance | Wall (s) | Interpretation | Reproduce |\n");
+    output.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|\n");
     for result in &report.results {
         output.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {} | `{}` |\n",
+            "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.3} | {:.3} | {:.3} | {:.3} | {} | {:.3} | {} | `{}` |\n",
             result.model,
             result.sessions,
             result.events,
@@ -100,6 +101,7 @@ pub fn render_markdown(report: &BenchmarkReport, json_path: &str) -> String {
             micros_to_millis(result.latency_us.p95),
             micros_to_millis(result.latency_us.p99),
             result.cpu_seconds,
+            result.cpu_source,
             result.wall_seconds,
             result.interpretation,
             result.command
@@ -111,7 +113,7 @@ pub fn render_markdown(report: &BenchmarkReport, json_path: &str) -> String {
 
 pub fn render_json(report: &BenchmarkReport) -> String {
     let mut output = format!(
-        "{{\n  \"schema_version\": 1,\n  \"run_id\": {},\n  \"generated_unix_seconds\": {},\n  \"machine\": {{\"os\": {}, \"architecture\": {}, \"rustc\": {}}},\n  \"config\": {{\"sessions\": {}, \"events_per_session\": {}, \"rate\": {}, \"fork_hold_ms\": {}, \"fork_cpu_ms\": {}, \"fork_rss_mib\": {}}},\n  \"results\": [\n",
+        "{{\n  \"schema_version\": 2,\n  \"run_id\": {},\n  \"generated_unix_seconds\": {},\n  \"machine\": {{\"os\": {}, \"architecture\": {}, \"rustc\": {}}},\n  \"config\": {{\"sessions\": {}, \"events_per_session\": {}, \"rate\": {}, \"fork_hold_ms\": {}, \"fork_cpu_ms\": {}, \"fork_rss_mib\": {}}},\n  \"results\": [\n",
         quote(&report.run_id),
         report.generated_unix_seconds,
         quote(&report.machine.os),
@@ -126,7 +128,7 @@ pub fn render_json(report: &BenchmarkReport) -> String {
     );
     for (index, result) in report.results.iter().enumerate() {
         output.push_str(&format!(
-            "    {{\n      \"model\": {},\n      \"sessions\": {},\n      \"events\": {},\n      \"processes_spawned\": {},\n      \"per_event_forks\": {},\n      \"peak_rss_bytes\": {},\n      \"events_per_second\": {:.6},\n      \"latency_us\": {{\"p50\": {}, \"p95\": {}, \"p99\": {}}},\n      \"cpu_seconds\": {:.6},\n      \"wall_seconds\": {:.6},\n      \"reproduce\": {},\n      \"interpretation\": {}\n    }}{}\n",
+            "    {{\n      \"model\": {},\n      \"sessions\": {},\n      \"events\": {},\n      \"processes_spawned\": {},\n      \"per_event_forks\": {},\n      \"peak_rss_bytes\": {},\n      \"events_per_second\": {:.6},\n      \"latency_us\": {{\"p50\": {}, \"p95\": {}, \"p99\": {}}},\n      \"cpu_seconds\": {:.6},\n      \"cpu_source\": {},\n      \"wall_seconds\": {:.6},\n      \"reproduce\": {},\n      \"interpretation\": {}\n    }}{}\n",
             quote(&result.model),
             result.sessions,
             result.events,
@@ -138,6 +140,7 @@ pub fn render_json(report: &BenchmarkReport) -> String {
             result.latency_us.p95,
             result.latency_us.p99,
             result.cpu_seconds,
+            quote(&result.cpu_source),
             result.wall_seconds,
             quote(&result.command),
             quote(&result.interpretation),

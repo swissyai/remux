@@ -1,4 +1,4 @@
-// Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
+// Kent Beck desiderata: specific and structure-insensitive wire behavior leads; fast, deterministic, isolated, behavior-sensitive, readable, writable, predictive, and inspiring examples keep the protocol approachable.
 
 use supervisor::protocol::{parse_message, Control, Event, EventKind, Message};
 

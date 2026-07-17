@@ -50,21 +50,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &binary_directory.join("fork-worker"),
         command.clone(),
     )?;
-    let supervisor_result = run_supervisor_baseline(
+    let scripted_result = run_supervisor_baseline(
         &config,
         &binary_directory.join("remux-supervisor"),
         &binary_directory.join("fake-agent"),
+        SupervisorAgent::Scripted,
+        command.clone(),
+    )?;
+    let real_agent_result = run_supervisor_baseline(
+        &config,
+        &binary_directory.join("remux-supervisor"),
+        &binary_directory.join("fake-agent"),
+        SupervisorAgent::RealShell,
         command,
     )?;
-    if supervisor_result.peak_rss_bytes >= SUPERVISOR_RSS_LIMIT_BYTES {
-        return Err(format!(
-            "supervisor peak RSS {:.2}MiB exceeds 200MiB contract",
-            bytes_to_mib(supervisor_result.peak_rss_bytes)
-        )
-        .into());
-    }
-    if supervisor_result.per_event_forks != 0 {
-        return Err("supervisor reported per-event forks".into());
+    for result in [&scripted_result, &real_agent_result] {
+        if result.peak_rss_bytes >= SUPERVISOR_RSS_LIMIT_BYTES {
+            return Err(format!(
+                "{} peak RSS {:.2}MiB exceeds 200MiB contract",
+                result.model,
+                bytes_to_mib(result.peak_rss_bytes)
+            )
+            .into());
+        }
+        if result.per_event_forks != 0 {
+            return Err(format!("{} measured per-event forks", result.model).into());
+        }
     }
 
     let generated_unix_seconds = unix_seconds()?;
@@ -74,7 +85,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         generated_unix_seconds,
         machine: machine()?,
         config: config.report_config(),
-        results: vec![fork_result, supervisor_result],
+        results: vec![fork_result, scripted_result, real_agent_result],
     };
     let results_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("results");
     fs::create_dir_all(&results_directory)?;
@@ -193,37 +204,92 @@ fn run_fork_baseline(
     let wall_seconds = started.elapsed().as_secs_f64();
     let latency_us = percentiles(&latencies)?;
     let peak_rss_bytes = resources.peak_rss_bytes();
+    let processes_spawned = resources.distinct_pid_count();
+    if processes_spawned != spawned {
+        return Err(format!(
+            "process sampler observed {processes_spawned}/{spawned} fork workers"
+        )
+        .into());
+    }
     Ok(ScenarioResult {
         model: "fork_per_event".to_owned(),
         sessions: config.sessions,
         events: total_events,
-        processes_spawned: spawned,
-        per_event_forks: spawned,
+        processes_spawned,
+        per_event_forks: processes_spawned,
         peak_rss_bytes,
         events_per_second: total_events as f64 / wall_seconds,
         latency_us: latency_us.clone(),
-        cpu_seconds: resources.cpu_seconds(),
+        cpu_seconds: total_events as f64 * config.fork_cpu_ms as f64 / 1_000.0,
+        cpu_source: "configured-by-construction (events × --fork-cpu-ms)".to_owned(),
         wall_seconds,
         command,
         interpretation: format!(
-            "One process per event produced {spawned} forks; p50 completion was {:.1}ms versus the configured {}ms hold.",
+            "Distinct-PID sampling measured {processes_spawned} event workers; p50 completion was {:.1}ms versus the configured {}ms hold.",
             latency_us.p50 as f64 / 1_000.0,
             config.fork_hold_ms
         ),
     })
 }
 
+#[derive(Clone, Copy)]
+enum SupervisorAgent {
+    Scripted,
+    RealShell,
+}
+
+impl SupervisorAgent {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Scripted => "scripted",
+            Self::RealShell => "real-shell",
+        }
+    }
+
+    fn model(self) -> &'static str {
+        match self {
+            Self::Scripted => "scripted_socket_supervisor",
+            Self::RealShell => "real_shell_socket_supervisor",
+        }
+    }
+}
+
 fn run_supervisor_baseline(
     config: &Config,
     supervisor: &Path,
     fake_agent: &Path,
+    agent: SupervisorAgent,
     command: String,
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     let temporary = TemporaryDirectory::new()?;
     let socket = temporary.path.join("s");
     let state = temporary.path.join("state.json");
+    let scrollback = temporary.path.join("scrollback");
     let metrics = temporary.path.join("metrics.tsv");
     let ready = temporary.path.join("ready.tsv");
+    let auth_log = temporary.path.join("attach.log");
+    let auth_token = format!("bench-{}-{}", agent.argument(), std::process::id());
+    let authorization = Command::new(supervisor)
+        .args([
+            "authorize",
+            "--auth-log",
+            path_text(&auth_log)?,
+            "--token",
+            &auth_token,
+            "--scope",
+            "launch",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !authorization.status.success() {
+        return Err(format!(
+            "attach authorization failed: {}",
+            String::from_utf8_lossy(&authorization.stderr).trim()
+        )
+        .into());
+    }
     let mut child = Command::new(supervisor)
         .args([
             "run",
@@ -233,10 +299,14 @@ fn run_supervisor_baseline(
             &config.events_per_session.to_string(),
             "--rate",
             &config.rate.to_string(),
+            "--agent-kind",
+            agent.argument(),
             "--socket",
             path_text(&socket)?,
             "--state",
             path_text(&state)?,
+            "--scrollback-dir",
+            path_text(&scrollback)?,
             "--metrics",
             path_text(&metrics)?,
             "--ready",
@@ -245,6 +315,12 @@ fn run_supervisor_baseline(
             path_text(fake_agent)?,
             "--timeout-seconds",
             &config.supervisor_timeout_seconds().to_string(),
+            "--auth-log",
+            path_text(&auth_log)?,
+            "--attach-token",
+            &auth_token,
+            "--attach-scope",
+            "launch",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -254,6 +330,7 @@ fn run_supervisor_baseline(
     let started = Instant::now();
     let timeout = Duration::from_secs_f64(config.estimated_supervisor_seconds() + 20.0);
     let mut resources = ResourceTracker::default();
+    let mut authorized_pids = None;
     let mut dump_sent = false;
     let status = loop {
         if started.elapsed() > timeout {
@@ -264,7 +341,10 @@ fn run_supervisor_baseline(
         let snapshot = system::snapshot()?;
         let selected = system::descendants(&snapshot, root_pid);
         resources.observe(&snapshot, &selected);
-        if ready.exists() && !dump_sent {
+        if ready.exists() && authorized_pids.is_none() {
+            authorized_pids = Some(parse_ready_pids(&ready, root_pid, config.sessions)?);
+        }
+        if authorized_pids.is_some() && !dump_sent {
             let mut stream = UnixStream::connect(&socket)?;
             stream.write_all(b"control\tdump\n")?;
             dump_sent = true;
@@ -285,13 +365,29 @@ fn run_supervisor_baseline(
     if !dump_sent {
         return Err("supervisor exited before accepting on-demand dump".into());
     }
+    let authorized_pids = authorized_pids.ok_or("supervisor produced no ready PID receipt")?;
+    let missed = authorized_pids
+        .difference(resources.observed_pids())
+        .copied()
+        .collect::<Vec<_>>();
+    if !missed.is_empty() {
+        return Err(format!("process sampler missed authorized startup PIDs {missed:?}").into());
+    }
+    let per_event_forks = u64::try_from(
+        resources
+            .observed_pids()
+            .difference(&authorized_pids)
+            .count(),
+    )?;
 
     let parsed = parse_metrics(&metrics)?;
     let total_events = config.total_events()?;
-    expect_metric(&parsed, "schema", 1)?;
+    expect_metric(&parsed, "schema", 2)?;
     expect_metric(&parsed, "events_ingested", total_events)?;
     expect_metric(&parsed, "children_spawned", u64::from(config.sessions))?;
-    expect_metric(&parsed, "per_event_forks", 0)?;
+    if parsed.get("agent_kind").map(String::as_str) != Some(agent.argument()) {
+        return Err("supervisor agent-kind receipt differs from requested scenario".into());
+    }
     if metric(&parsed, "on_demand_dumps")? == 0 {
         return Err("on-demand state dump was not observed".into());
     }
@@ -315,24 +411,53 @@ fn run_supervisor_baseline(
 
     let latency_us = percentiles(&latencies)?;
     let peak_rss_bytes = resources.peak_rss_bytes();
+    let processes_spawned = resources.distinct_pid_count();
     Ok(ScenarioResult {
-        model: "socket_supervisor".to_owned(),
+        model: agent.model().to_owned(),
         sessions: config.sessions,
         events: total_events,
-        processes_spawned: u64::from(config.sessions) + 1,
-        per_event_forks: 0,
+        processes_spawned,
+        per_event_forks,
         peak_rss_bytes,
         events_per_second: total_events as f64 / wall_seconds,
         latency_us,
         cpu_seconds: resources.cpu_seconds(),
+        cpu_source: "sampled cumulative process-tree CPU via ps".to_owned(),
         wall_seconds,
         command,
         interpretation: format!(
-            "{} PTY sessions ingested {total_events} events through one socket with zero per-event forks at {:.2}MiB peak RSS.",
+            "{} attached PTY sessions ingested {total_events} events through one socket; distinct-PID sampling found {processes_spawned} processes and {per_event_forks} event forks at {:.2}MiB peak RSS.",
             config.sessions,
             bytes_to_mib(peak_rss_bytes)
         ),
     })
+}
+
+fn parse_ready_pids(path: &Path, root_pid: u32, sessions: u32) -> io::Result<BTreeSet<u32>> {
+    let ready = parse_metrics(path)?;
+    let recorded_root = metric(&ready, "pid")?;
+    if recorded_root != u64::from(root_pid) {
+        return Err(io::Error::other("ready receipt root PID differs"));
+    }
+    expect_metric(&ready, "children", u64::from(sessions))?;
+    let child_pids = ready
+        .get("child_pids")
+        .ok_or_else(|| io::Error::other("ready receipt missing child_pids"))?
+        .split(',')
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| io::Error::other("invalid child PID in ready receipt"))
+        })
+        .collect::<io::Result<BTreeSet<_>>>()?;
+    if child_pids.len() != usize::try_from(sessions).map_err(io::Error::other)? {
+        return Err(io::Error::other(
+            "distinct child PID count differs from session count",
+        ));
+    }
+    let mut authorized = child_pids;
+    authorized.insert(root_pid);
+    Ok(authorized)
 }
 
 fn parse_metrics(path: &Path) -> io::Result<BTreeMap<String, String>> {
@@ -491,10 +616,10 @@ impl Config {
             )
             .into());
         }
-        if self.estimated_fork_seconds() >= BENCHMARK_BUDGET_SECONDS
-            || self.estimated_supervisor_seconds() >= BENCHMARK_BUDGET_SECONDS
-        {
-            return Err("configuration exceeds five-minute benchmark budget".into());
+        let sweep_seconds = self.estimated_fork_seconds()
+            + self.estimated_supervisor_seconds() * 2.0;
+        if sweep_seconds >= BENCHMARK_BUDGET_SECONDS {
+            return Err("configuration exceeds five-minute full-sweep budget".into());
         }
         Ok(())
     }

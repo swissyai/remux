@@ -1,4 +1,4 @@
-// Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
+// Kent Beck desiderata: readable, writable, and predictive receipts lead; fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, and inspiring checks protect publication.
 
 use bench::{
     percentiles, render_json, render_markdown, BenchmarkConfig, BenchmarkReport, Machine,
@@ -36,6 +36,7 @@ fn every_report_row_carries_its_reproduction_command() {
             p99: 300,
         },
         cpu_seconds: 0.1,
+        cpu_source: "sampled cumulative process-tree CPU via ps".into(),
         wall_seconds: 6.0,
         command: "scripts/with_scorer_lock.sh cargo run -p bench".into(),
         interpretation: "One socket, no event forks.".into(),
@@ -64,6 +65,9 @@ fn every_report_row_carries_its_reproduction_command() {
 
     assert!(markdown.contains("| `scripts/with_scorer_lock.sh cargo run -p bench` |"));
     assert!(markdown.contains("One socket, no event forks."));
+    assert!(markdown.contains("Distinct processes measured"));
+    assert!(markdown.contains("sampled cumulative process-tree CPU via ps"));
+    assert!(json.contains("\"schema_version\": 2"));
     assert!(json.contains("\"per_event_forks\": 0"));
     assert!(json.contains("\"reproduce\": \"scripts/with_scorer_lock.sh cargo run -p bench\""));
 }
