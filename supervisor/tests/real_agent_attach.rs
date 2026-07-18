@@ -137,6 +137,7 @@ fn relaunch_without_token_is_logged_and_refused_before_agent_spawn() {
     fs::create_dir(&root).expect("create relaunch fixture root");
     let auth = root.join("attach.log");
     let ready = root.join("ready.tsv");
+    let frame = root.join("frame.ansi");
 
     let output = Command::new(supervisor_binary())
         .current_dir(&root)
@@ -154,6 +155,8 @@ fn relaunch_without_token_is_logged_and_refused_before_agent_spawn() {
             text(&auth),
             "--attach-scope",
             "relaunch",
+            "--tui-output",
+            text(&frame),
         ])
         .output()
         .expect("request unauthorized relaunch");
@@ -164,6 +167,10 @@ fn relaunch_without_token_is_logged_and_refused_before_agent_spawn() {
     assert!(
         !ready.exists(),
         "refusal must happen before any child is ready"
+    );
+    assert!(
+        !frame.exists(),
+        "refusal must happen before the TUI creates output"
     );
     assert_eq!(
         fs::read_to_string(&auth).expect("read refusal audit"),
