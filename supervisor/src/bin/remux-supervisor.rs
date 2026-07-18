@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! PTY supervisor: authorized startup, one listener socket, batched state, and an
 //! asynchronous scrollback persistence path.
 
@@ -18,7 +19,8 @@ use supervisor::attach::{
 use supervisor::protocol::{parse_message, unix_micros_now, Control, Event, EventKind, Message};
 use supervisor::restore::inspect_passive;
 use supervisor::scrollback::ScrollbackWriter;
-use supervisor::state::{dump_atomic, LiveState};
+use supervisor::state::{dump_atomic, restore_passive, LiveState};
+use supervisor::tui::{TracerRenderer, TracerTabView};
 
 const MAX_MESSAGE_BYTES: usize = 4_096;
 const MAX_BATCH_MESSAGES: usize = 256;
@@ -39,6 +41,7 @@ fn entrypoint() -> Result<(), Box<dyn std::error::Error>> {
         Some("run") => run_supervisor(RunConfig::parse(arguments)?),
         Some("dump") => request_dump(DumpConfig::parse(arguments)?),
         Some("restore") => inspect_restore(RestoreConfig::parse(arguments)?),
+        Some("tui") => render_restore(TuiConfig::parse(arguments)?),
         _ => Err(usage().into()),
     }
 }
@@ -59,7 +62,6 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     prepare_output(&config.ready_file)?;
     prepare_output(&config.metrics_file)?;
     let listener = UnixListener::bind(&config.socket)?;
-    listener.set_nonblocking(true)?;
     let _socket_guard = SocketGuard(config.socket.clone());
     let stopping = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
@@ -69,6 +71,13 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
         .map(|index| format!("session-{index:03}"))
         .collect::<Vec<_>>();
     let mut state = LiveState::new(session_ids.iter().cloned())?;
+    let mut renderer = match &config.tui_target {
+        Some(target) => Some(TracerRenderer::new(
+            target.open()?,
+            TracerTabView::live(session_ids.iter(), true)?,
+        )),
+        None => None,
+    };
     let scrollback = ScrollbackWriter::start(&config.scrollback_dir, session_ids.iter().cloned())?;
     let interval_us = u64::from(config.sessions)
         .checked_mul(1_000_000)
@@ -81,9 +90,15 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut pty_readers = Vec::with_capacity(config.sessions as usize);
     let mut pty_writers = Vec::with_capacity(config.sessions as usize);
     for (index, session_id) in session_ids.iter().enumerate() {
-        let start_delay_us = stagger_us
-            .checked_mul(u64::try_from(index)?)
-            .ok_or("start stagger overflow")?;
+        let start_delay_us = config
+            .initial_idle_ms
+            .checked_mul(1_000)
+            .and_then(|idle| {
+                stagger_us
+                    .checked_mul(u64::try_from(index).ok()?)
+                    .and_then(|stagger| idle.checked_add(stagger))
+            })
+            .ok_or("start delay overflow")?;
         match config.agent_kind {
             AgentKind::Scripted => {
                 let mut command = Command::new(&config.fake_agent);
@@ -124,6 +139,9 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if let Some(renderer) = &mut renderer {
+        renderer.redraw()?;
+    }
     write_ready(&config.ready_file, &config.socket, &children)?;
 
     let expected_events = u64::from(config.sessions)
@@ -136,18 +154,21 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut batches = 0_u64;
     let mut on_demand_dumps = 0_u64;
     let mut latencies_us = Vec::with_capacity(usize::try_from(expected_events)?);
+    let mut redraw_latencies_us = Vec::with_capacity(usize::try_from(expected_events)?);
     while events_ingested < expected_events {
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out after ingesting {events_ingested}/{expected_events} events"
-            )
-            .into());
-        }
-        let first = match receiver.recv_timeout(Duration::from_millis(20)) {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                format!("timed out after ingesting {events_ingested}/{expected_events} events")
+            })?;
+        let first = match receiver.recv_timeout(remaining) {
             Ok(message) => message,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 fail_if_child_exited(&mut children)?;
-                continue;
+                return Err(format!(
+                    "timed out after ingesting {events_ingested}/{expected_events} events"
+                )
+                .into());
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("ingest channel disconnected".into())
@@ -180,6 +201,16 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("ingested event count overflow")?;
             let pending = state.apply_batch(&events)?;
             scrollback.enqueue(pending)?;
+            if let Some(renderer) = &mut renderer {
+                renderer.view_mut().apply_batch(&events, true)?;
+                renderer.redraw()?;
+                let redrawn = unix_micros_now()?;
+                redraw_latencies_us.extend(
+                    events
+                        .iter()
+                        .map(|event| redrawn.saturating_sub(event.sent_unix_micros)),
+                );
+            }
         }
         if dump_requested {
             let offsets = scrollback.flush()?;
@@ -222,9 +253,13 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
             pty_bytes,
             on_demand_dumps,
             latencies_us,
+            frames_rendered: renderer.as_ref().map_or(0, TracerRenderer::frames_rendered),
+            redraw_latencies_us,
         },
     )?;
     stopping.store(true, Ordering::Release);
+    let wake = UnixStream::connect(&config.socket)?;
+    drop(wake);
     listener_thread
         .join()
         .map_err(|_| "socket listener panicked")??;
@@ -242,6 +277,14 @@ fn inspect_restore(config: RestoreConfig) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn render_restore(config: TuiConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let state = restore_passive(&config.state_file)?;
+    let view = TracerTabView::from_passive(&state)?;
+    let mut renderer = TracerRenderer::new(config.target.open()?, view);
+    renderer.redraw()?;
+    Ok(())
+}
+
 fn spawn_listener(
     listener: UnixListener,
     stopping: Arc<AtomicBool>,
@@ -249,18 +292,13 @@ fn spawn_listener(
 ) -> JoinHandle<io::Result<()>> {
     thread::spawn(move || {
         let mut readers = Vec::new();
-        while !stopping.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    let sender = sender.clone();
-                    readers.push(thread::spawn(move || read_stream(stream, sender)));
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(2));
-                }
-                Err(error) => return Err(error),
+        loop {
+            let (stream, _) = listener.accept()?;
+            if stopping.load(Ordering::Acquire) {
+                break;
             }
+            let sender = sender.clone();
+            readers.push(thread::spawn(move || read_stream(stream, sender)));
         }
         drop(sender);
         for reader in readers {
@@ -378,8 +416,7 @@ fn spawn_real_agent_events(
                 kind: EventKind::Output,
                 payload: payload.to_owned(),
             };
-            socket
-                .write_all(event.encode().map_err(io::Error::other)?.as_bytes())?;
+            socket.write_all(event.encode().map_err(io::Error::other)?.as_bytes())?;
             sequence = sequence
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("real agent event sequence overflow"))?;
@@ -430,28 +467,36 @@ struct RunMetrics {
     pty_bytes: u64,
     on_demand_dumps: u64,
     latencies_us: Vec<u64>,
+    frames_rendered: u64,
+    redraw_latencies_us: Vec<u64>,
 }
 
 fn write_metrics(path: &Path, metrics: &RunMetrics) -> io::Result<()> {
-    let latencies = metrics
-        .latencies_us
-        .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    let latencies = join_numbers(&metrics.latencies_us);
+    let redraw_latencies = join_numbers(&metrics.redraw_latencies_us);
     fs::write(
         path,
         format!(
-            "schema\t2\nagent_kind\t{}\nevents_ingested\t{}\nbatches\t{}\nchildren_spawned\t{}\npty_bytes\t{}\non_demand_dumps\t{}\nlatencies_us\t{}\n",
+            "schema\t2\nagent_kind\t{}\nevents_ingested\t{}\nbatches\t{}\nchildren_spawned\t{}\npty_bytes\t{}\non_demand_dumps\t{}\nlatencies_us\t{}\nframes_rendered\t{}\nredraw_latencies_us\t{}\n",
             metrics.agent_kind.as_str(),
             metrics.events_ingested,
             metrics.batches,
             metrics.children_spawned,
             metrics.pty_bytes,
             metrics.on_demand_dumps,
-            latencies
+            latencies,
+            metrics.frames_rendered,
+            redraw_latencies
         ),
     )
+}
+
+fn join_numbers(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn prepare_output(path: &Path) -> io::Result<()> {
@@ -497,6 +542,20 @@ impl AgentKind {
     }
 }
 
+enum TuiTarget {
+    StandardOutput,
+    File(PathBuf),
+}
+
+impl TuiTarget {
+    fn open(&self) -> io::Result<Box<dyn Write>> {
+        match self {
+            Self::StandardOutput => Ok(Box::new(io::stdout())),
+            Self::File(path) => Ok(Box::new(File::create(path)?)),
+        }
+    }
+}
+
 struct RunConfig {
     sessions: u32,
     events_per_session: u64,
@@ -513,6 +572,8 @@ struct RunConfig {
     auth_log: PathBuf,
     attach_token: Option<String>,
     attach_scope: AttachScope,
+    initial_idle_ms: u64,
+    tui_target: Option<TuiTarget>,
 }
 
 impl RunConfig {
@@ -532,15 +593,21 @@ impl RunConfig {
         let mut auth_log = PathBuf::from("remux-attach.log");
         let mut attach_token = None;
         let mut attach_scope = AttachScope::Launch;
+        let mut initial_idle_ms = 0;
+        let mut tui_target = None;
         let mut arguments = arguments;
         while let Some(flag) = arguments.next() {
+            if flag == "--tui" {
+                tui_target = Some(TuiTarget::StandardOutput);
+                continue;
+            }
             let value = arguments
                 .next()
                 .ok_or_else(|| format!("missing value for {flag}"))?;
             match flag.as_str() {
                 "--sessions" => sessions = parse_positive(&value, "sessions")?,
                 "--events-per-session" => {
-                    events_per_session = parse_positive(&value, "events-per-session")?
+                    events_per_session = parse_positive(&value, "events-per-session")?;
                 }
                 "--rate" => rate = parse_positive(&value, "rate")?,
                 "--socket" => socket = PathBuf::from(value),
@@ -555,6 +622,10 @@ impl RunConfig {
                 "--auth-log" => auth_log = PathBuf::from(value),
                 "--attach-token" => attach_token = Some(value),
                 "--attach-scope" => attach_scope = AttachScope::parse(&value)?,
+                "--initial-idle-ms" => {
+                    initial_idle_ms = value.parse().map_err(|_| "invalid initial-idle-ms")?;
+                }
+                "--tui-output" => tui_target = Some(TuiTarget::File(PathBuf::from(value))),
                 _ => return Err(format!("unknown flag {flag}").into()),
             }
         }
@@ -574,6 +645,8 @@ impl RunConfig {
             auth_log,
             attach_token,
             attach_scope,
+            initial_idle_ms,
+            tui_target,
         })
     }
 }
@@ -647,6 +720,31 @@ impl RestoreConfig {
     }
 }
 
+struct TuiConfig {
+    state_file: PathBuf,
+    target: TuiTarget,
+}
+
+impl TuiConfig {
+    fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut state_file = None;
+        let mut target = TuiTarget::StandardOutput;
+        let mut arguments = arguments;
+        while let Some(flag) = arguments.next() {
+            let value = arguments.next().ok_or_else(|| usage().to_owned())?;
+            match flag.as_str() {
+                "--state" => state_file = Some(PathBuf::from(value)),
+                "--output" => target = TuiTarget::File(PathBuf::from(value)),
+                _ => return Err(usage().to_owned()),
+            }
+        }
+        Ok(Self {
+            state_file: state_file.ok_or_else(|| usage().to_owned())?,
+            target,
+        })
+    }
+}
+
 fn parse_positive<T>(value: &str, name: &str) -> Result<T, Box<dyn std::error::Error>>
 where
     T: std::str::FromStr + PartialEq + From<u8>,
@@ -666,5 +764,5 @@ fn sibling_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn usage() -> &'static str {
-    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell] [--agent-shell PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH"
+    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell] [--agent-shell PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]"
 }

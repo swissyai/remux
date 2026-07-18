@@ -1,8 +1,9 @@
 // Kent Beck desiderata: readable, writable, and predictive receipts lead; fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, and inspiring checks protect publication.
+#![forbid(unsafe_code)]
 
 use bench::{
     percentiles, render_json, render_markdown, BenchmarkConfig, BenchmarkReport, Machine,
-    Percentiles, ScenarioResult,
+    Percentiles, ScenarioResult, TuiScenarioResult,
 };
 
 #[test]
@@ -58,6 +59,29 @@ fn every_report_row_carries_its_reproduction_command() {
             fork_rss_mib: 18,
         },
         results: vec![result],
+        tui_result: Some(TuiScenarioResult {
+            model: "tui_real_shell".into(),
+            sessions: 20,
+            events: 120,
+            processes_spawned: 21,
+            per_event_forks: 0,
+            tui_peak_rss_bytes: 8 * 1024 * 1024,
+            child_agent_peak_rss_bytes: 20 * 1024 * 1024,
+            total_peak_rss_bytes: 28 * 1024 * 1024,
+            idle_window_seconds: 60.0,
+            idle_cpu_seconds: 0.01,
+            idle_cpu_percent: 0.016,
+            idle_frames_rendered: 0,
+            redraw_latency_us: Percentiles {
+                p50: 150,
+                p95: 500,
+                p99: 900,
+            },
+            frames_rendered: 7,
+            wall_seconds: 67.0,
+            command: "scripts/with_scorer_lock.sh cargo run -p bench".into(),
+            interpretation: "Event-driven tracer tabs.".into(),
+        }),
     };
 
     let markdown = render_markdown(&report, "results/latest.json");
@@ -67,7 +91,12 @@ fn every_report_row_carries_its_reproduction_command() {
     assert!(markdown.contains("One socket, no event forks."));
     assert!(markdown.contains("Distinct processes measured"));
     assert!(markdown.contains("sampled cumulative process-tree CPU via ps"));
-    assert!(json.contains("\"schema_version\": 2"));
+    assert!(markdown.contains("TUI-only RSS (MiB)"));
+    assert!(markdown.contains("Event-driven tracer tabs."));
+    assert!(json.contains("\"schema_version\": 3"));
     assert!(json.contains("\"per_event_forks\": 0"));
+    assert!(json.contains("\"tui_peak_rss_bytes\": 8388608"));
+    assert!(json.contains("\"idle_cpu_percent\": 0.016000"));
+    assert!(json.contains("\"idle_frames_rendered\": 0"));
     assert!(json.contains("\"reproduce\": \"scripts/with_scorer_lock.sh cargo run -p bench\""));
 }

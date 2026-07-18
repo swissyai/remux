@@ -1,9 +1,8 @@
-// Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
-//! Narrow PTY process boundary.
+//! Narrow PTY system-call boundary.
 //!
-//! Contract: allocate one PTY pair per session, attach the child to the slave side,
-//! and return its master stream to the supervisor. Process creation happens once per
-//! session, never in response to an event.
+//! Contract: allocate one PTY pair, attach a child to its slave, and return the
+//! child plus the owned master stream. This crate is the workspace's sole unsafe
+//! exception; callers retain all authorization responsibility.
 
 use std::fs::File;
 use std::io;
@@ -30,6 +29,10 @@ unsafe extern "C" {
     fn fcntl(file_descriptor: i32, command: i32, argument: i32) -> i32;
 }
 
+/// Spawns `command` with a fresh PTY as its controlling terminal.
+///
+/// The returned file owns the PTY master. The function fails before returning a
+/// child if PTY allocation, descriptor setup, session setup, or spawn fails.
 pub fn spawn_pty(command: &mut Command) -> io::Result<(Child, File)> {
     let (master, slave) = pty_pair()?;
     let slave_fd = slave.as_raw_fd();
@@ -65,9 +68,9 @@ fn pty_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: successful `openpty` returned two newly owned descriptors.
+    // SAFETY: successful `openpty` returned a newly owned master descriptor.
     let master = unsafe { OwnedFd::from_raw_fd(master) };
-    // SAFETY: successful `openpty` returned two newly owned descriptors.
+    // SAFETY: successful `openpty` returned a newly owned slave descriptor.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     set_close_on_exec(&master)?;
     set_close_on_exec(&slave)?;
@@ -75,7 +78,7 @@ fn pty_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 fn set_close_on_exec(file: &OwnedFd) -> io::Result<()> {
-    // SAFETY: the descriptor is valid and F_SETFD takes an integer bit mask.
+    // SAFETY: `file` owns a valid descriptor and F_SETFD takes an integer bit mask.
     if unsafe { fcntl(file.as_raw_fd(), F_SETFD, FD_CLOEXEC) } == -1 {
         Err(io::Error::last_os_error())
     } else {

@@ -9,8 +9,6 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command};
 
-use crate::pty;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachScope {
     Launch,
@@ -86,7 +84,7 @@ pub fn spawn_authorized_pty(
     command: &mut Command,
 ) -> io::Result<(Child, File)> {
     let _scope = authorization.scope();
-    pty::spawn_pty(command)
+    remux_pty::spawn_pty(command)
 }
 
 fn authorization_counts(log: &Path, scope: AttachScope, token: &str) -> io::Result<(u64, u64)> {

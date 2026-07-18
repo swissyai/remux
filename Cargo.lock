@@ -7,5 +7,12 @@ name = "bench"
 version = "0.1.0"
 
 [[package]]
+name = "remux-pty"
+version = "0.1.0"
+
+[[package]]
 name = "supervisor"
 version = "0.1.0"
+dependencies = [
+ "remux-pty",
+]

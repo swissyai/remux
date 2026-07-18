@@ -6,13 +6,18 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::json::{self, Value};
 use crate::protocol::{Event, EventKind};
 
 const SCHEMA_VERSION: u64 = 2;
+const MAX_PERSISTED_STATE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SESSIONS: usize = 64;
+const MAX_SESSION_ID_BYTES: usize = 128;
+const MAX_STATUS_BYTES: usize = 256;
+const MAX_SCROLLBACK_LINE_BYTES: usize = 4_096;
 const SCROLLBACK_TAIL_LINES: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -81,8 +86,16 @@ impl LiveState {
                 }
             }
             match event.kind {
-                EventKind::Status => session.status.clone_from(&event.payload),
+                EventKind::Status => {
+                    validate_bounded_text(&event.payload, MAX_STATUS_BYTES, "session status")?;
+                    session.status.clone_from(&event.payload);
+                }
                 EventKind::Output => {
+                    validate_bounded_text(
+                        &event.payload,
+                        MAX_SCROLLBACK_LINE_BYTES,
+                        "scrollback line",
+                    )?;
                     let offset = session.next_scrollback_offset;
                     if session.scrollback_tail.len() == SCROLLBACK_TAIL_LINES {
                         session.scrollback_tail.pop_front();
@@ -108,10 +121,7 @@ impl LiveState {
         Ok(pending)
     }
 
-    pub fn mark_scrollback_persisted(
-        &mut self,
-        offsets: &BTreeMap<String, u64>,
-    ) -> io::Result<()> {
+    pub fn mark_scrollback_persisted(&mut self, offsets: &BTreeMap<String, u64>) -> io::Result<()> {
         if offsets.len() != self.sessions.len() {
             return Err(invalid_data("persisted scrollback session count differs"));
         }
@@ -221,7 +231,16 @@ pub fn dump_atomic(path: &Path, state: &LiveState) -> io::Result<()> {
 }
 
 pub fn restore_passive(path: &Path) -> io::Result<PersistedState> {
-    let input = fs::read_to_string(path)?;
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    let read_limit = u64::try_from(MAX_PERSISTED_STATE_BYTES.saturating_add(1))
+        .map_err(|_| invalid_data("persisted state size limit overflow"))?;
+    file.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PERSISTED_STATE_BYTES {
+        return Err(invalid_data("persisted state exceeds size limit"));
+    }
+    let input =
+        String::from_utf8(bytes).map_err(|_| invalid_data("persisted state is not UTF-8"))?;
     let value = json::parse(&input).map_err(|error| invalid_data(error.to_string()))?;
     decode_state(&value)
 }
@@ -310,6 +329,9 @@ fn decode_state(value: &Value) -> io::Result<PersistedState> {
     }
     let layout = decode_layout(field(object, "layout")?)?;
     let sessions_value = array(field(object, "sessions")?, "sessions")?;
+    if sessions_value.len() > MAX_SESSIONS {
+        return Err(invalid_data("persisted session count exceeds limit"));
+    }
     let sessions = sessions_value
         .iter()
         .map(decode_session)
@@ -348,7 +370,9 @@ fn decode_session(value: &Value) -> io::Result<PersistedSession> {
         "session",
     )?;
     let id = string(field(object, "id")?, "session.id")?.to_owned();
+    validate_session_id(&id)?;
     let status = string(field(object, "status")?, "session.status")?.to_owned();
+    validate_bounded_text(&status, MAX_STATUS_BYTES, "session status")?;
     let last_event = match field(object, "last_event")? {
         Value::Null => None,
         value => Some(decode_event(value)?),
@@ -387,27 +411,23 @@ fn decode_scrollback(value: &Value) -> io::Result<PersistedScrollback> {
     let object = object(value, "scrollback")?;
     exact_fields(
         object,
-        &[
-            "segments_file",
-            "persisted_through",
-            "tail",
-            "next_offset",
-        ],
+        &["segments_file", "persisted_through", "tail", "next_offset"],
         "scrollback",
     )?;
     let tail = array(field(object, "tail")?, "scrollback.tail")?
         .iter()
-        .map(|value| string(value, "scrollback line").map(str::to_owned))
+        .map(|value| {
+            let line = string(value, "scrollback line")?;
+            validate_bounded_text(line, MAX_SCROLLBACK_LINE_BYTES, "scrollback line")?;
+            Ok(line.to_owned())
+        })
         .collect::<io::Result<Vec<_>>>()?;
     if tail.len() > SCROLLBACK_TAIL_LINES {
         return Err(invalid_data("persisted scrollback tail exceeds limit"));
     }
     Ok(PersistedScrollback {
-        segments_file: string(
-            field(object, "segments_file")?,
-            "scrollback.segments_file",
-        )?
-        .to_owned(),
+        segments_file: string(field(object, "segments_file")?, "scrollback.segments_file")?
+            .to_owned(),
         persisted_through: number(
             field(object, "persisted_through")?,
             "scrollback.persisted_through",
@@ -496,11 +516,19 @@ fn number(value: &Value, name: &str) -> io::Result<u64> {
 
 fn validate_session_id(session_id: &str) -> io::Result<()> {
     if session_id.is_empty()
+        || session_id.len() > MAX_SESSION_ID_BYTES
         || !session_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
         return Err(invalid_data("invalid session id"));
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(value: &str, maximum_bytes: usize, name: &str) -> io::Result<()> {
+    if value.is_empty() || value.len() > maximum_bytes {
+        return Err(invalid_data(format!("invalid {name} length")));
     }
     Ok(())
 }

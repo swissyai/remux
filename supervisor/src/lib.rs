@@ -1,4 +1,5 @@
 // Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
+#![forbid(unsafe_code)]
 //! Supervisor library boundary.
 //!
 //! Contract: callers provide validated event messages; this crate updates bounded
@@ -7,7 +8,7 @@
 pub mod attach;
 mod json;
 pub mod protocol;
-mod pty;
 pub mod restore;
 pub mod scrollback;
 pub mod state;
+pub mod tui;

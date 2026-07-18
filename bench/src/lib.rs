@@ -1,4 +1,5 @@
 // Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
+#![forbid(unsafe_code)]
 //! Public report boundary for the W1 benchmark harness.
 //!
 //! Contract: scenario runners return measurements in common units; renderers produce
@@ -13,6 +14,7 @@ pub struct BenchmarkReport {
     pub machine: Machine,
     pub config: BenchmarkConfig,
     pub results: Vec<ScenarioResult>,
+    pub tui_result: Option<TuiScenarioResult>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +58,32 @@ pub struct Percentiles {
     pub p99: u64,
 }
 
+/// Measured 20-tab render scenario with root/child resource separation.
+///
+/// Values come from external process-tree snapshots and flushed-frame timestamps;
+/// construction fails in the harness before a report is emitted when any rail is
+/// violated.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TuiScenarioResult {
+    pub model: String,
+    pub sessions: u32,
+    pub events: u64,
+    pub processes_spawned: u64,
+    pub per_event_forks: u64,
+    pub tui_peak_rss_bytes: u64,
+    pub child_agent_peak_rss_bytes: u64,
+    pub total_peak_rss_bytes: u64,
+    pub idle_window_seconds: f64,
+    pub idle_cpu_seconds: f64,
+    pub idle_cpu_percent: f64,
+    pub idle_frames_rendered: u64,
+    pub redraw_latency_us: Percentiles,
+    pub frames_rendered: u64,
+    pub wall_seconds: f64,
+    pub command: String,
+    pub interpretation: String,
+}
+
 pub fn percentiles(samples: &[u64]) -> Result<Percentiles, &'static str> {
     if samples.is_empty() {
         return Err("latency sample set is empty");
@@ -76,7 +104,7 @@ fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
 
 pub fn render_markdown(report: &BenchmarkReport, json_path: &str) -> String {
     let mut output = format!(
-        "# W2 benchmark results\n\nMeasured on `{}` / `{}` with `{}` at Unix time `{}`. Machine-readable receipt: [`{}`]({}).\n\n",
+        "# W3 benchmark results\n\nMeasured on `{}` / `{}` with `{}` at Unix time `{}`. Machine-readable receipt: [`{}`]({}).\n\n",
         report.machine.os,
         report.machine.architecture,
         report.machine.rustc,
@@ -107,13 +135,42 @@ pub fn render_markdown(report: &BenchmarkReport, json_path: &str) -> String {
             result.command
         ));
     }
+    output.push_str("\n## TUI render receipt\n\nTUI-only RSS is the resident supervisor/TUI root process; child-agent RSS is the authorized child set; total RSS is the simultaneously sampled complete subject tree. Idle CPU is root-process CPU delta / 60-second blocked idle wall window × 100. Event→redraw latency ends after the ANSI frame flush.\n\n");
+    output.push_str("| Model | Sessions | Events | Distinct processes measured | Per-event forks measured | TUI-only RSS (MiB) | Child-agent RSS (MiB) | TUI-inclusive total RSS (MiB) | Idle window (s) | Idle (CPU s / % / frames) | redraw p50 (ms) | redraw p95 (ms) | redraw p99 (ms) | Frames | Wall (s) | Interpretation | Reproduce |\n");
+    output.push_str(
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
+    );
+    if let Some(result) = &report.tui_result {
+        output.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.1} | {:.3} / {:.3}% / {} frames | {:.3} | {:.3} | {:.3} | {} | {:.3} | {} | `{}` |\n",
+            result.model,
+            result.sessions,
+            result.events,
+            result.processes_spawned,
+            result.per_event_forks,
+            bytes_to_mib(result.tui_peak_rss_bytes),
+            bytes_to_mib(result.child_agent_peak_rss_bytes),
+            bytes_to_mib(result.total_peak_rss_bytes),
+            result.idle_window_seconds,
+            result.idle_cpu_seconds,
+            result.idle_cpu_percent,
+            result.idle_frames_rendered,
+            micros_to_millis(result.redraw_latency_us.p50),
+            micros_to_millis(result.redraw_latency_us.p95),
+            micros_to_millis(result.redraw_latency_us.p99),
+            result.frames_rendered,
+            result.wall_seconds,
+            result.interpretation,
+            result.command
+        ));
+    }
     output.push_str("\n## Reproduction\n\nEach table row carries its complete reproduction command. Cargo is forced offline by `.cargo/config.toml`; run the command from the repository root. The sweep refuses configurations whose estimated runtime exceeds five minutes or whose fork baseline could exceed the harness memory rail.\n");
     output
 }
 
 pub fn render_json(report: &BenchmarkReport) -> String {
     let mut output = format!(
-        "{{\n  \"schema_version\": 2,\n  \"run_id\": {},\n  \"generated_unix_seconds\": {},\n  \"machine\": {{\"os\": {}, \"architecture\": {}, \"rustc\": {}}},\n  \"config\": {{\"sessions\": {}, \"events_per_session\": {}, \"rate\": {}, \"fork_hold_ms\": {}, \"fork_cpu_ms\": {}, \"fork_rss_mib\": {}}},\n  \"results\": [\n",
+        "{{\n  \"schema_version\": 3,\n  \"run_id\": {},\n  \"generated_unix_seconds\": {},\n  \"machine\": {{\"os\": {}, \"architecture\": {}, \"rustc\": {}}},\n  \"config\": {{\"sessions\": {}, \"events_per_session\": {}, \"rate\": {}, \"fork_hold_ms\": {}, \"fork_cpu_ms\": {}, \"fork_rss_mib\": {}}},\n  \"results\": [\n",
         quote(&report.run_id),
         report.generated_unix_seconds,
         quote(&report.machine.os),
@@ -147,7 +204,33 @@ pub fn render_json(report: &BenchmarkReport) -> String {
             if index + 1 == report.results.len() { "" } else { "," }
         ));
     }
-    output.push_str("  ]\n}\n");
+    output.push_str("  ],\n  \"tui_result\": ");
+    match &report.tui_result {
+        Some(result) => output.push_str(&format!(
+            "{{\n    \"model\": {},\n    \"sessions\": {},\n    \"events\": {},\n    \"processes_spawned\": {},\n    \"per_event_forks\": {},\n    \"tui_peak_rss_bytes\": {},\n    \"child_agent_peak_rss_bytes\": {},\n    \"total_peak_rss_bytes\": {},\n    \"idle_window_seconds\": {:.6},\n    \"idle_cpu_seconds\": {:.6},\n    \"idle_cpu_percent\": {:.6},\n    \"idle_frames_rendered\": {},\n    \"redraw_latency_us\": {{\"p50\": {}, \"p95\": {}, \"p99\": {}}},\n    \"frames_rendered\": {},\n    \"wall_seconds\": {:.6},\n    \"reproduce\": {},\n    \"interpretation\": {}\n  }}",
+            quote(&result.model),
+            result.sessions,
+            result.events,
+            result.processes_spawned,
+            result.per_event_forks,
+            result.tui_peak_rss_bytes,
+            result.child_agent_peak_rss_bytes,
+            result.total_peak_rss_bytes,
+            result.idle_window_seconds,
+            result.idle_cpu_seconds,
+            result.idle_cpu_percent,
+            result.idle_frames_rendered,
+            result.redraw_latency_us.p50,
+            result.redraw_latency_us.p95,
+            result.redraw_latency_us.p99,
+            result.frames_rendered,
+            result.wall_seconds,
+            quote(&result.command),
+            quote(&result.interpretation)
+        )),
+        None => output.push_str("null"),
+    }
+    output.push_str("\n}\n");
     output
 }
 

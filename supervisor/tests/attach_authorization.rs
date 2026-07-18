@@ -1,4 +1,5 @@
 // Kent Beck desiderata: behavior-sensitive, specific, and predictive lead; fast, deterministic, isolated, structure-insensitive, readable, writable, and inspiring keep the safety test durable.
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::path::PathBuf;

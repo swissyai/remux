@@ -1,0 +1,9 @@
+[package]
+name = "remux-pty"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# No third-party crates: this crate is the sole system-ABI boundary.

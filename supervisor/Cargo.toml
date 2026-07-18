@@ -15,4 +15,5 @@ name = "fake-agent"
 path = "src/bin/fake-agent.rs"
 
 [dependencies]
-# No third-party crates: the tracer uses only std and narrow system ABI calls.
+# Local syscall seam only; no third-party crates.
+remux-pty = { path = "../pty" }

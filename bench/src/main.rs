@@ -1,4 +1,5 @@
 // Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
+#![forbid(unsafe_code)]
 //! Synthetic fleet orchestrator.
 //!
 //! Contract: the harness imports no supervisor internals. It drives compiled binaries
@@ -17,13 +18,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bench::system::{self, ResourceTracker};
 use bench::{
     bytes_to_mib, percentiles, render_json, render_markdown, BenchmarkConfig, BenchmarkReport,
-    Machine, ScenarioResult,
+    Machine, ScenarioResult, TuiScenarioResult,
 };
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
 const SUPERVISOR_RSS_LIMIT_BYTES: u64 = 200 * 1024 * 1024;
 const BENCHMARK_BUDGET_SECONDS: f64 = 300.0;
 const FORK_MEMORY_RAIL_MIB: u64 = 512;
+const TUI_IDLE_WINDOW: Duration = Duration::from_secs(60);
+const TUI_INITIAL_IDLE_MS: u64 = 65_000;
+const TUI_IDLE_CPU_LIMIT_PERCENT: f64 = 0.5;
+const TUI_REDRAW_P95_LIMIT_US: u64 = 50_000;
 
 fn main() {
     if let Err(error) = run() {
@@ -62,6 +67,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &binary_directory.join("remux-supervisor"),
         &binary_directory.join("fake-agent"),
         SupervisorAgent::RealShell,
+        command.clone(),
+    )?;
+    let tui_result = run_tui_baseline(
+        &config,
+        &binary_directory.join("remux-supervisor"),
+        &binary_directory.join("fake-agent"),
         command,
     )?;
     for result in [&scripted_result, &real_agent_result] {
@@ -77,6 +88,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("{} measured per-event forks", result.model).into());
         }
     }
+    if tui_result.total_peak_rss_bytes >= SUPERVISOR_RSS_LIMIT_BYTES {
+        return Err(format!(
+            "{} TUI-inclusive RSS {:.2}MiB exceeds 200MiB contract",
+            tui_result.model,
+            bytes_to_mib(tui_result.total_peak_rss_bytes)
+        )
+        .into());
+    }
+    if tui_result.per_event_forks != 0 {
+        return Err("TUI scenario measured per-event forks".into());
+    }
+    if tui_result.idle_cpu_percent > TUI_IDLE_CPU_LIMIT_PERCENT {
+        return Err(format!(
+            "TUI idle CPU {:.3}% exceeds {:.3}% gate",
+            tui_result.idle_cpu_percent, TUI_IDLE_CPU_LIMIT_PERCENT
+        )
+        .into());
+    }
+    if tui_result.redraw_latency_us.p95 >= TUI_REDRAW_P95_LIMIT_US {
+        return Err(format!(
+            "TUI redraw p95 {}us exceeds {}us gate",
+            tui_result.redraw_latency_us.p95, TUI_REDRAW_P95_LIMIT_US
+        )
+        .into());
+    }
 
     let generated_unix_seconds = unix_seconds()?;
     let run_id = format!("run-{generated_unix_seconds}-{}", std::process::id());
@@ -86,6 +122,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         machine: machine()?,
         config: config.report_config(),
         results: vec![fork_result, scripted_result, real_agent_result],
+        tui_result: Some(tui_result),
     };
     let results_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("results");
     fs::create_dir_all(&results_directory)?;
@@ -101,7 +138,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("wrote {}", markdown_path.display());
     println!("wrote {}", timestamped_path.display());
-    for result in report.results {
+    for result in &report.results {
         println!(
             "{}: {} events, {} spawns, {:.2}MiB peak RSS, {:.2} events/s",
             result.model,
@@ -109,6 +146,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             result.processes_spawned,
             bytes_to_mib(result.peak_rss_bytes),
             result.events_per_second
+        );
+    }
+    if let Some(result) = &report.tui_result {
+        println!(
+            "{}: {:.2}MiB TUI + {:.2}MiB children, {:.3}% idle CPU, {}us redraw p95",
+            result.model,
+            bytes_to_mib(result.tui_peak_rss_bytes),
+            bytes_to_mib(result.child_agent_peak_rss_bytes),
+            result.idle_cpu_percent,
+            result.redraw_latency_us.p95
         );
     }
     Ok(())
@@ -206,10 +253,9 @@ fn run_fork_baseline(
     let peak_rss_bytes = resources.peak_rss_bytes();
     let processes_spawned = resources.distinct_pid_count();
     if processes_spawned != spawned {
-        return Err(format!(
-            "process sampler observed {processes_spawned}/{spawned} fork workers"
-        )
-        .into());
+        return Err(
+            format!("process sampler observed {processes_spawned}/{spawned} fork workers").into(),
+        );
     }
     Ok(ScenarioResult {
         model: "fork_per_event".to_owned(),
@@ -269,27 +315,7 @@ fn run_supervisor_baseline(
     let ready = temporary.path.join("ready.tsv");
     let auth_log = temporary.path.join("attach.log");
     let auth_token = format!("bench-{}-{}", agent.argument(), std::process::id());
-    let authorization = Command::new(supervisor)
-        .args([
-            "authorize",
-            "--auth-log",
-            path_text(&auth_log)?,
-            "--token",
-            &auth_token,
-            "--scope",
-            "launch",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !authorization.status.success() {
-        return Err(format!(
-            "attach authorization failed: {}",
-            String::from_utf8_lossy(&authorization.stderr).trim()
-        )
-        .into());
-    }
+    authorize(supervisor, &auth_log, &auth_token)?;
     let mut child = Command::new(supervisor)
         .args([
             "run",
@@ -394,16 +420,7 @@ fn run_supervisor_baseline(
     if metric(&parsed, "pty_bytes")? == 0 {
         return Err("PTY sessions produced no output".into());
     }
-    let latencies = parsed
-        .get("latencies_us")
-        .ok_or("metrics missing latencies_us")?
-        .split(',')
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .map_err(|_| io::Error::other("invalid latency metric"))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+    let latencies = parse_metric_samples(&parsed, "latencies_us")?;
     if latencies.len() != usize::try_from(total_events)? {
         return Err("latency sample count differs from event count".into());
     }
@@ -431,6 +448,293 @@ fn run_supervisor_baseline(
             bytes_to_mib(peak_rss_bytes)
         ),
     })
+}
+
+fn run_tui_baseline(
+    config: &Config,
+    supervisor: &Path,
+    fake_agent: &Path,
+    command: String,
+) -> Result<TuiScenarioResult, Box<dyn std::error::Error>> {
+    let temporary = TemporaryDirectory::new()?;
+    let socket = temporary.path.join("s");
+    let state = temporary.path.join("state.json");
+    let scrollback = temporary.path.join("scrollback");
+    let metrics = temporary.path.join("metrics.tsv");
+    let ready = temporary.path.join("ready.tsv");
+    let auth_log = temporary.path.join("attach.log");
+    let tui_output = temporary.path.join("tui.ansi");
+    let auth_token = format!("bench-tui-{}", std::process::id());
+    authorize(supervisor, &auth_log, &auth_token)?;
+    let timeout_seconds = TUI_INITIAL_IDLE_MS
+        .div_ceil(1_000)
+        .saturating_add(config.supervisor_timeout_seconds())
+        .saturating_add(20);
+    let mut child = Command::new(supervisor)
+        .args([
+            "run",
+            "--sessions",
+            &config.sessions.to_string(),
+            "--events-per-session",
+            &config.events_per_session.to_string(),
+            "--rate",
+            &config.rate.to_string(),
+            "--agent-kind",
+            "real-shell",
+            "--socket",
+            path_text(&socket)?,
+            "--state",
+            path_text(&state)?,
+            "--scrollback-dir",
+            path_text(&scrollback)?,
+            "--metrics",
+            path_text(&metrics)?,
+            "--ready",
+            path_text(&ready)?,
+            "--fake-agent",
+            path_text(fake_agent)?,
+            "--timeout-seconds",
+            &timeout_seconds.to_string(),
+            "--auth-log",
+            path_text(&auth_log)?,
+            "--attach-token",
+            &auth_token,
+            "--attach-scope",
+            "launch",
+            "--initial-idle-ms",
+            &TUI_INITIAL_IDLE_MS.to_string(),
+            "--tui-output",
+            path_text(&tui_output)?,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let root_pid = child.id();
+    let started = Instant::now();
+    let result = (|| -> Result<TuiScenarioResult, Box<dyn std::error::Error>> {
+        let root_set = BTreeSet::from([root_pid]);
+        let startup_deadline = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .ok_or("TUI startup deadline overflow")?;
+        let mut total_resources = ResourceTracker::default();
+        let mut tui_resources = ResourceTracker::default();
+        let authorized_pids = loop {
+            let snapshot = system::snapshot()?;
+            let selected = system::descendants(&snapshot, root_pid);
+            total_resources.observe(&snapshot, &selected);
+            tui_resources.observe(&snapshot, &root_set);
+            if ready.exists() {
+                break parse_ready_pids(&ready, root_pid, config.sessions)?;
+            }
+            if let Some(status) = child.try_wait()? {
+                return Err(format!("TUI supervisor exited during startup with {status}").into());
+            }
+            if Instant::now() >= startup_deadline {
+                return Err("TUI supervisor did not become ready".into());
+            }
+            thread::sleep(SAMPLE_INTERVAL);
+        };
+        let child_pids = authorized_pids
+            .iter()
+            .copied()
+            .filter(|pid| *pid != root_pid)
+            .collect::<BTreeSet<_>>();
+        let mut child_resources = ResourceTracker::default();
+        let initial_snapshot = system::snapshot()?;
+        observe_tui_resources(
+            &initial_snapshot,
+            root_pid,
+            &child_pids,
+            &mut total_resources,
+            &mut tui_resources,
+            &mut child_resources,
+        );
+        let idle_cpu_start = system::selected_cpu_seconds(&initial_snapshot, &root_set);
+        let initial_frame_bytes = fs::metadata(&tui_output)?.len();
+        if initial_frame_bytes == 0 {
+            return Err("TUI produced no initial frame before ready".into());
+        }
+
+        let idle_started = Instant::now();
+        let idle_deadline = idle_started
+            .checked_add(TUI_IDLE_WINDOW)
+            .ok_or("TUI idle deadline overflow")?;
+        let (idle_final_snapshot, idle_window_seconds) = loop {
+            let snapshot = system::snapshot()?;
+            observe_tui_resources(
+                &snapshot,
+                root_pid,
+                &child_pids,
+                &mut total_resources,
+                &mut tui_resources,
+                &mut child_resources,
+            );
+            if let Some(status) = child.try_wait()? {
+                return Err(format!("TUI supervisor exited during idle with {status}").into());
+            }
+            let now = Instant::now();
+            if now >= idle_deadline {
+                break (snapshot, idle_started.elapsed().as_secs_f64());
+            }
+            let remaining = idle_deadline.saturating_duration_since(now);
+            thread::sleep(remaining.min(Duration::from_millis(100)));
+        };
+        let idle_cpu_end = system::selected_cpu_seconds(&idle_final_snapshot, &root_set);
+        let idle_cpu_seconds = (idle_cpu_end - idle_cpu_start).max(0.0);
+        let idle_cpu_percent = idle_cpu_seconds / idle_window_seconds * 100.0;
+        if fs::metadata(&tui_output)?.len() != initial_frame_bytes {
+            return Err("TUI emitted a frame without a state event during idle".into());
+        }
+
+        let process_deadline = started
+            .checked_add(Duration::from_secs(timeout_seconds.saturating_add(10)))
+            .ok_or("TUI process deadline overflow")?;
+        let status = loop {
+            let snapshot = system::snapshot()?;
+            observe_tui_resources(
+                &snapshot,
+                root_pid,
+                &child_pids,
+                &mut total_resources,
+                &mut tui_resources,
+                &mut child_resources,
+            );
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= process_deadline {
+                return Err("TUI supervisor timed out after idle window".into());
+            }
+            thread::sleep(SAMPLE_INTERVAL);
+        };
+        let wall_seconds = started.elapsed().as_secs_f64();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            pipe.read_to_string(&mut stderr)?;
+        }
+        if !status.success() {
+            return Err(format!("TUI supervisor exited with {status}: {}", stderr.trim()).into());
+        }
+
+        let missed = authorized_pids
+            .difference(total_resources.observed_pids())
+            .copied()
+            .collect::<Vec<_>>();
+        if !missed.is_empty() {
+            return Err(format!("TUI process sampler missed authorized PIDs {missed:?}").into());
+        }
+        let per_event_forks = u64::try_from(
+            total_resources
+                .observed_pids()
+                .difference(&authorized_pids)
+                .count(),
+        )?;
+        let parsed = parse_metrics(&metrics)?;
+        let total_events = config.total_events()?;
+        expect_metric(&parsed, "schema", 2)?;
+        expect_metric(&parsed, "events_ingested", total_events)?;
+        expect_metric(&parsed, "children_spawned", u64::from(config.sessions))?;
+        if parsed.get("agent_kind").map(String::as_str) != Some("real-shell") {
+            return Err("TUI receipt did not use real-shell agents".into());
+        }
+        let redraw_latencies = parse_metric_samples(&parsed, "redraw_latencies_us")?;
+        if redraw_latencies.len() != usize::try_from(total_events)? {
+            return Err("TUI redraw latency count differs from event count".into());
+        }
+        let frames_rendered = metric(&parsed, "frames_rendered")?;
+        if frames_rendered < 2 || frames_rendered > total_events.saturating_add(1) {
+            return Err("TUI frame count is outside event-driven bounds".into());
+        }
+        let output = fs::read_to_string(&tui_output)?;
+        for index in 0..config.sessions {
+            if !output.contains(&format!("session-{index:03}")) {
+                return Err(format!("TUI output misses session-{index:03}").into());
+            }
+        }
+        if !output.contains("AGENT DRIVING") {
+            return Err("TUI output misses agent-driving indicator".into());
+        }
+        verify_passive_restore(supervisor, &state)?;
+
+        let redraw_latency_us = percentiles(&redraw_latencies)?;
+        let tui_peak_rss_bytes = tui_resources.peak_rss_bytes();
+        let child_agent_peak_rss_bytes = child_resources.peak_rss_bytes();
+        let total_peak_rss_bytes = total_resources.peak_rss_bytes();
+        let processes_spawned = total_resources.distinct_pid_count();
+        Ok(TuiScenarioResult {
+            model: "real_shell_tui".to_owned(),
+            sessions: config.sessions,
+            events: total_events,
+            processes_spawned,
+            per_event_forks,
+            tui_peak_rss_bytes,
+            child_agent_peak_rss_bytes,
+            total_peak_rss_bytes,
+            idle_window_seconds,
+            idle_cpu_seconds,
+            idle_cpu_percent,
+            idle_frames_rendered: 0,
+            redraw_latency_us,
+            frames_rendered,
+            wall_seconds,
+            command,
+            interpretation: format!(
+                "One event-driven ANSI TUI rendered {} live tabs over {} authorized real shells; root and child RSS were sampled separately, with no frame bytes written during the 60s idle window.",
+                config.sessions, config.sessions
+            ),
+        })
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+fn observe_tui_resources(
+    snapshot: &[system::ProcessEntry],
+    root_pid: u32,
+    child_pids: &BTreeSet<u32>,
+    total: &mut ResourceTracker,
+    tui: &mut ResourceTracker,
+    children: &mut ResourceTracker,
+) {
+    let all = system::descendants(snapshot, root_pid);
+    let root = BTreeSet::from([root_pid]);
+    total.observe(snapshot, &all);
+    tui.observe(snapshot, &root);
+    children.observe(snapshot, child_pids);
+}
+
+fn authorize(
+    supervisor: &Path,
+    auth_log: &Path,
+    auth_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let authorization = Command::new(supervisor)
+        .args([
+            "authorize",
+            "--auth-log",
+            path_text(auth_log)?,
+            "--token",
+            auth_token,
+            "--scope",
+            "launch",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if authorization.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "attach authorization failed: {}",
+            String::from_utf8_lossy(&authorization.stderr).trim()
+        )
+        .into())
+    }
 }
 
 fn parse_ready_pids(path: &Path, root_pid: u32, sessions: u32) -> io::Result<BTreeSet<u32>> {
@@ -472,6 +776,23 @@ fn parse_metrics(path: &Path) -> io::Result<BTreeMap<String, String>> {
         }
     }
     Ok(metrics)
+}
+
+fn parse_metric_samples(metrics: &BTreeMap<String, String>, name: &str) -> io::Result<Vec<u64>> {
+    let values = metrics
+        .get(name)
+        .ok_or_else(|| io::Error::other(format!("metrics missing {name}")))?;
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    values
+        .split(',')
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| io::Error::other(format!("invalid metric sample {name}")))
+        })
+        .collect()
 }
 
 fn metric(metrics: &BTreeMap<String, String>, name: &str) -> io::Result<u64> {
@@ -581,7 +902,7 @@ impl Config {
             match flag.as_str() {
                 "--sessions" => config.sessions = parse_positive(&value, "sessions")?,
                 "--events-per-session" => {
-                    config.events_per_session = parse_positive(&value, "events-per-session")?
+                    config.events_per_session = parse_positive(&value, "events-per-session")?;
                 }
                 "--rate" => config.rate = parse_positive(&value, "rate")?,
                 "--fork-hold-ms" => config.fork_hold_ms = parse_positive(&value, "fork-hold-ms")?,
@@ -617,7 +938,8 @@ impl Config {
             .into());
         }
         let sweep_seconds = self.estimated_fork_seconds()
-            + self.estimated_supervisor_seconds() * 2.0;
+            + self.estimated_supervisor_seconds() * 3.0
+            + TUI_INITIAL_IDLE_MS as f64 / 1_000.0;
         if sweep_seconds >= BENCHMARK_BUDGET_SECONDS {
             return Err("configuration exceeds five-minute full-sweep budget".into());
         }
@@ -640,7 +962,10 @@ impl Config {
     }
 
     fn supervisor_timeout_seconds(&self) -> u64 {
-        self.estimated_supervisor_seconds().ceil() as u64 + 10
+        u64::from(self.sessions)
+            .saturating_mul(self.events_per_session)
+            .div_ceil(self.rate)
+            .saturating_add(10)
     }
 
     fn reproduction_command(&self) -> String {

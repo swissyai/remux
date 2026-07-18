@@ -1,11 +1,13 @@
 // Kent Beck desiderata: predictive and behavior-sensitive safety dominate; fast, deterministic, isolated, structure-insensitive, specific, readable, writable, and inspiring fixtures make failures actionable.
+#![forbid(unsafe_code)]
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 
 use supervisor::protocol::{Event, EventKind};
 use supervisor::scrollback::{read_segments, segment_path, ScrollbackWriter};
-use supervisor::state::{dump_atomic, restore_passive, LiveState};
+use supervisor::state::{dump_atomic, restore_passive, LiveState, PendingScrollback};
 
 fn test_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("remux-{name}-{}", std::process::id()))
@@ -69,7 +71,10 @@ fn passive_state_round_trips_append_only_segments_and_tail_pointers() {
         ["compiled target", "tests passed"]
     );
     assert_eq!(restored.sessions[0].scrollback.persisted_through, 2);
-    assert_eq!(restored.sessions[0].scrollback.segments_file, "session-000.segments");
+    assert_eq!(
+        restored.sessions[0].scrollback.segments_file,
+        "session-000.segments"
+    );
     assert_eq!(
         read_segments(
             &segment_file,
@@ -79,10 +84,87 @@ fn passive_state_round_trips_append_only_segments_and_tail_pointers() {
         ["compiled target", "tests passed"]
     );
     assert!(
-        !root.join(format!(".state.json.tmp-{}", std::process::id())).exists(),
+        !root
+            .join(format!(".state.json.tmp-{}", std::process::id()))
+            .exists(),
         "atomic rename must leave no temporary state file"
     );
     fs::remove_dir_all(root).expect("remove state fixture");
+}
+
+#[test]
+fn scrollback_reader_rejects_truncated_segment_and_torn_final_frame() {
+    let root = test_path("scrollback-faults");
+    let segments = root.join("scrollback");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).expect("create scrollback fault root");
+    let writer =
+        ScrollbackWriter::start(&segments, ["session-000"]).expect("start scrollback fault writer");
+    writer
+        .enqueue(vec![PendingScrollback {
+            session_id: "session-000".to_owned(),
+            offset: 0,
+            payload: "complete".to_owned(),
+        }])
+        .expect("enqueue complete frame");
+    writer.finish().expect("finish complete frame");
+    let path = segment_path(&segments, "session-000");
+    let complete = fs::read(&path).expect("read complete frame");
+
+    fs::write(&path, &complete[..complete.len() - 1]).expect("inject truncated payload");
+    let truncated = read_segments(&path, 1).expect_err("truncated frame must fail closed");
+    assert_eq!(truncated.kind(), std::io::ErrorKind::UnexpectedEof);
+
+    fs::write(&path, &complete).expect("restore complete first frame");
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open segment for torn append");
+    file.write_all(b"RMS2").expect("append final magic");
+    file.write_all(&1_u64.to_le_bytes())
+        .expect("append final offset");
+    file.write_all(&1_u32.to_le_bytes())
+        .expect("append final count");
+    file.write_all(&4_u32.to_le_bytes())
+        .expect("append final length");
+    file.write_all(b"to").expect("inject torn final payload");
+    drop(file);
+
+    let torn = read_segments(&path, 2).expect_err("torn final frame must fail closed");
+    assert_eq!(torn.kind(), std::io::ErrorKind::UnexpectedEof);
+    fs::remove_dir_all(root).expect("remove scrollback fault fixture");
+}
+
+#[test]
+fn passive_restore_rejects_truncation_and_hostile_persisted_fields() {
+    let root = test_path("restore-faults");
+    let path = root.join("state.json");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).expect("create restore fault root");
+    let valid = "{\"schema_version\":2,\"restore_policy\":\"passive\",\"layout\":{\"kind\":\"tabs\",\"session_ids\":[\"session-000\"]},\"sessions\":[{\"id\":\"session-000\",\"status\":\"idle\",\"last_event\":null,\"scrollback\":{\"segments_file\":\"session-000.segments\",\"persisted_through\":0,\"tail\":[],\"next_offset\":0}}]}";
+
+    fs::write(&path, &valid[..valid.len() - 1]).expect("inject truncated state");
+    assert!(restore_passive(&path).is_err(), "truncated state must fail");
+
+    for hostile in [
+        valid.replace(
+            "\"status\":\"idle\"",
+            "\"status\":\"idle\",\"command\":\"/bin/sh\"",
+        ),
+        valid.replace("session-000.segments", "../../agent-token"),
+        valid.replace("\"persisted_through\":0", "\"persisted_through\":1"),
+        valid.replace(
+            "\"status\":\"idle\"",
+            &format!("\"status\":\"{}\"", "x".repeat(257)),
+        ),
+    ] {
+        fs::write(&path, hostile).expect("write hostile persisted field");
+        assert!(
+            restore_passive(&path).is_err(),
+            "hostile persisted field must fail closed"
+        );
+    }
+    fs::remove_dir_all(root).expect("remove restore fault fixture");
 }
 
 #[test]
