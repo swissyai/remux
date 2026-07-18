@@ -108,10 +108,7 @@ impl LiveState {
         Ok(pending)
     }
 
-    pub fn mark_scrollback_persisted(
-        &mut self,
-        offsets: &BTreeMap<String, u64>,
-    ) -> io::Result<()> {
+    pub fn mark_scrollback_persisted(&mut self, offsets: &BTreeMap<String, u64>) -> io::Result<()> {
         if offsets.len() != self.sessions.len() {
             return Err(invalid_data("persisted scrollback session count differs"));
         }
@@ -387,12 +384,7 @@ fn decode_scrollback(value: &Value) -> io::Result<PersistedScrollback> {
     let object = object(value, "scrollback")?;
     exact_fields(
         object,
-        &[
-            "segments_file",
-            "persisted_through",
-            "tail",
-            "next_offset",
-        ],
+        &["segments_file", "persisted_through", "tail", "next_offset"],
         "scrollback",
     )?;
     let tail = array(field(object, "tail")?, "scrollback.tail")?
@@ -403,11 +395,8 @@ fn decode_scrollback(value: &Value) -> io::Result<PersistedScrollback> {
         return Err(invalid_data("persisted scrollback tail exceeds limit"));
     }
     Ok(PersistedScrollback {
-        segments_file: string(
-            field(object, "segments_file")?,
-            "scrollback.segments_file",
-        )?
-        .to_owned(),
+        segments_file: string(field(object, "segments_file")?, "scrollback.segments_file")?
+            .to_owned(),
         persisted_through: number(
             field(object, "persisted_through")?,
             "scrollback.persisted_through",

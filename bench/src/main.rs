@@ -1,4 +1,5 @@
 // Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
+#![forbid(unsafe_code)]
 //! Synthetic fleet orchestrator.
 //!
 //! Contract: the harness imports no supervisor internals. It drives compiled binaries
@@ -206,10 +207,9 @@ fn run_fork_baseline(
     let peak_rss_bytes = resources.peak_rss_bytes();
     let processes_spawned = resources.distinct_pid_count();
     if processes_spawned != spawned {
-        return Err(format!(
-            "process sampler observed {processes_spawned}/{spawned} fork workers"
-        )
-        .into());
+        return Err(
+            format!("process sampler observed {processes_spawned}/{spawned} fork workers").into(),
+        );
     }
     Ok(ScenarioResult {
         model: "fork_per_event".to_owned(),
@@ -581,7 +581,7 @@ impl Config {
             match flag.as_str() {
                 "--sessions" => config.sessions = parse_positive(&value, "sessions")?,
                 "--events-per-session" => {
-                    config.events_per_session = parse_positive(&value, "events-per-session")?
+                    config.events_per_session = parse_positive(&value, "events-per-session")?;
                 }
                 "--rate" => config.rate = parse_positive(&value, "rate")?,
                 "--fork-hold-ms" => config.fork_hold_ms = parse_positive(&value, "fork-hold-ms")?,
@@ -616,8 +616,8 @@ impl Config {
             )
             .into());
         }
-        let sweep_seconds = self.estimated_fork_seconds()
-            + self.estimated_supervisor_seconds() * 2.0;
+        let sweep_seconds =
+            self.estimated_fork_seconds() + self.estimated_supervisor_seconds() * 2.0;
         if sweep_seconds >= BENCHMARK_BUDGET_SECONDS {
             return Err("configuration exceeds five-minute full-sweep budget".into());
         }
@@ -640,7 +640,10 @@ impl Config {
     }
 
     fn supervisor_timeout_seconds(&self) -> u64 {
-        self.estimated_supervisor_seconds().ceil() as u64 + 10
+        u64::from(self.sessions)
+            .saturating_mul(self.events_per_session)
+            .div_ceil(self.rate)
+            .saturating_add(10)
     }
 
     fn reproduction_command(&self) -> String {

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! PTY supervisor: authorized startup, one listener socket, batched state, and an
 //! asynchronous scrollback persistence path.
 
@@ -378,8 +379,7 @@ fn spawn_real_agent_events(
                 kind: EventKind::Output,
                 payload: payload.to_owned(),
             };
-            socket
-                .write_all(event.encode().map_err(io::Error::other)?.as_bytes())?;
+            socket.write_all(event.encode().map_err(io::Error::other)?.as_bytes())?;
             sequence = sequence
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("real agent event sequence overflow"))?;
@@ -540,7 +540,7 @@ impl RunConfig {
             match flag.as_str() {
                 "--sessions" => sessions = parse_positive(&value, "sessions")?,
                 "--events-per-session" => {
-                    events_per_session = parse_positive(&value, "events-per-session")?
+                    events_per_session = parse_positive(&value, "events-per-session")?;
                 }
                 "--rate" => rate = parse_positive(&value, "rate")?,
                 "--socket" => socket = PathBuf::from(value),

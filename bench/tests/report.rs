@@ -1,4 +1,5 @@
 // Kent Beck desiderata: readable, writable, and predictive receipts lead; fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, and inspiring checks protect publication.
+#![forbid(unsafe_code)]
 
 use bench::{
     percentiles, render_json, render_markdown, BenchmarkConfig, BenchmarkReport, Machine,

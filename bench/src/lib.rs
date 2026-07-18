@@ -1,4 +1,5 @@
 // Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
+#![forbid(unsafe_code)]
 //! Public report boundary for the W1 benchmark harness.
 //!
 //! Contract: scenario runners return measurements in common units; renderers produce

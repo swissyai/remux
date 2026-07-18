@@ -1,4 +1,5 @@
 // Kent Beck desiderata: predictive and behavior-sensitive safety dominate; fast, deterministic, isolated, structure-insensitive, specific, readable, writable, and inspiring fixtures make failures actionable.
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::path::PathBuf;
@@ -69,7 +70,10 @@ fn passive_state_round_trips_append_only_segments_and_tail_pointers() {
         ["compiled target", "tests passed"]
     );
     assert_eq!(restored.sessions[0].scrollback.persisted_through, 2);
-    assert_eq!(restored.sessions[0].scrollback.segments_file, "session-000.segments");
+    assert_eq!(
+        restored.sessions[0].scrollback.segments_file,
+        "session-000.segments"
+    );
     assert_eq!(
         read_segments(
             &segment_file,
@@ -79,7 +83,9 @@ fn passive_state_round_trips_append_only_segments_and_tail_pointers() {
         ["compiled target", "tests passed"]
     );
     assert!(
-        !root.join(format!(".state.json.tmp-{}", std::process::id())).exists(),
+        !root
+            .join(format!(".state.json.tmp-{}", std::process::id()))
+            .exists(),
         "atomic rename must leave no temporary state file"
     );
     fs::remove_dir_all(root).expect("remove state fixture");

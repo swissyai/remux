@@ -1,4 +1,5 @@
 // Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
+#![forbid(unsafe_code)]
 //! Short-lived process used to model one hook process per event.
 
 use std::env;
@@ -62,7 +63,7 @@ impl Config {
                 "--cpu-ms" => cpu_ms = Some(parse_positive(&value, "cpu-ms")?),
                 "--rss-mib" => rss_mib = Some(parse_positive(&value, "rss-mib")?),
                 "--kind" if matches!(value.as_str(), "status" | "tool" | "output") => {
-                    kind = Some(value)
+                    kind = Some(value);
                 }
                 "--kind" => return Err("invalid event kind".into()),
                 _ => return Err(format!("unknown flag {flag}").into()),

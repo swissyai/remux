@@ -1,4 +1,5 @@
 // Tests prioritize: fast, deterministic, isolated, behavior-sensitive, structure-insensitive, specific, readable, writable, predictive, and inspiring.
+#![forbid(unsafe_code)]
 //! Scripted PTY child used by the synthetic fleet.
 
 use std::env;
@@ -90,7 +91,7 @@ impl Config {
                 "--interval-us" => interval_us = Some(parse_positive(&value, "interval-us")?),
                 "--start-delay-us" => {
                     start_delay_us =
-                        Some(value.parse::<u64>().map_err(|_| "invalid start-delay-us")?)
+                        Some(value.parse::<u64>().map_err(|_| "invalid start-delay-us")?);
                 }
                 _ => return Err(format!("unknown flag {flag}").into()),
             }
