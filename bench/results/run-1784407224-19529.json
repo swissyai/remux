@@ -1,7 +1,7 @@
 {
   "schema_version": 3,
-  "run_id": "run-1784406928-8701",
-  "generated_unix_seconds": 1784406928,
+  "run_id": "run-1784407224-19529",
+  "generated_unix_seconds": 1784407224,
   "machine": {"os": "macos 15.6.1", "architecture": "aarch64", "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)"},
   "config": {"sessions": 20, "events_per_session": 6, "rate": 20, "fork_hold_ms": 360, "fork_cpu_ms": 30, "fork_rss_mib": 18},
   "results": [
@@ -11,14 +11,14 @@
       "events": 120,
       "processes_spawned": 120,
       "per_event_forks": 120,
-      "peak_rss_bytes": 202833920,
-      "events_per_second": 18.929846,
-      "latency_us": {"p50": 398494, "p95": 450234, "p99": 475128},
+      "peak_rss_bytes": 223363072,
+      "events_per_second": 18.784952,
+      "latency_us": {"p50": 408008, "p95": 462470, "p99": 584316},
       "cpu_seconds": 3.600000,
       "cpu_source": "configured-by-construction (events × --fork-cpu-ms)",
-      "wall_seconds": 6.339196,
+      "wall_seconds": 6.388092,
       "reproduce": "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
-      "interpretation": "Distinct-PID sampling measured 120 event workers; p50 completion was 398.5ms versus the configured 360ms hold."
+      "interpretation": "Distinct-PID sampling measured 120 event workers; p50 completion was 408.0ms versus the configured 360ms hold."
     },
     {
       "model": "scripted_socket_supervisor",
@@ -26,14 +26,14 @@
       "events": 120,
       "processes_spawned": 21,
       "per_event_forks": 0,
-      "peak_rss_bytes": 39813120,
-      "events_per_second": 19.353261,
-      "latency_us": {"p50": 65, "p95": 153, "p99": 878},
+      "peak_rss_bytes": 39305216,
+      "events_per_second": 18.827885,
+      "latency_us": {"p50": 62, "p95": 100, "p99": 124},
       "cpu_seconds": 0.020000,
       "cpu_source": "sampled cumulative process-tree CPU via ps",
-      "wall_seconds": 6.200505,
+      "wall_seconds": 6.373525,
       "reproduce": "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
-      "interpretation": "20 attached PTY sessions ingested 120 events through one socket; distinct-PID sampling found 21 processes and 0 event forks at 37.97MiB peak RSS."
+      "interpretation": "20 attached PTY sessions ingested 120 events through one socket; distinct-PID sampling found 21 processes and 0 event forks at 37.48MiB peak RSS."
     },
     {
       "model": "real_shell_socket_supervisor",
@@ -41,14 +41,14 @@
       "events": 120,
       "processes_spawned": 21,
       "per_event_forks": 0,
-      "peak_rss_bytes": 57655296,
-      "events_per_second": 19.709070,
-      "latency_us": {"p50": 43, "p95": 66, "p99": 151},
-      "cpu_seconds": 0.050000,
+      "peak_rss_bytes": 58408960,
+      "events_per_second": 19.705300,
+      "latency_us": {"p50": 38, "p95": 58, "p99": 74},
+      "cpu_seconds": 0.040000,
       "cpu_source": "sampled cumulative process-tree CPU via ps",
-      "wall_seconds": 6.088567,
+      "wall_seconds": 6.089732,
       "reproduce": "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
-      "interpretation": "20 attached PTY sessions ingested 120 events through one socket; distinct-PID sampling found 21 processes and 0 event forks at 54.98MiB peak RSS."
+      "interpretation": "20 attached PTY sessions ingested 120 events through one socket; distinct-PID sampling found 21 processes and 0 event forks at 55.70MiB peak RSS."
     }
   ],
   "tui_result": {
@@ -57,16 +57,16 @@
     "events": 120,
     "processes_spawned": 21,
     "per_event_forks": 0,
-    "tui_peak_rss_bytes": 5521408,
-    "child_agent_peak_rss_bytes": 51396608,
-    "total_peak_rss_bytes": 56721408,
-    "idle_window_seconds": 60.089876,
+    "tui_peak_rss_bytes": 5357568,
+    "child_agent_peak_rss_bytes": 52543488,
+    "total_peak_rss_bytes": 57884672,
+    "idle_window_seconds": 60.037172,
     "idle_cpu_seconds": 0.110000,
-    "idle_cpu_percent": 0.183059,
+    "idle_cpu_percent": 0.183220,
     "idle_frames_rendered": 0,
-    "redraw_latency_us": {"p50": 83, "p95": 154, "p99": 205},
-    "frames_rendered": 119,
-    "wall_seconds": 71.179105,
+    "redraw_latency_us": {"p50": 77, "p95": 134, "p99": 199},
+    "frames_rendered": 121,
+    "wall_seconds": 71.090934,
     "reproduce": "scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
     "interpretation": "One event-driven ANSI TUI rendered 20 live tabs over 20 authorized real shells; root and child RSS were sampled separately, with no frame bytes written during the 60s idle window."
   }
