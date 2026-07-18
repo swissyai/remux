@@ -7,6 +7,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+const MAX_NESTING_DEPTH: usize = 64;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Value {
     Null,
@@ -59,7 +61,7 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn value(&mut self, depth: usize) -> Result<Value, Error> {
-        if depth > 64 {
+        if depth > MAX_NESTING_DEPTH {
             return Err(self.error("JSON nesting exceeds limit"));
         }
         self.whitespace();
@@ -197,8 +199,14 @@ impl Parser<'_> {
 
     fn number(&mut self) -> Result<u64, Error> {
         let start = self.position;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.position += 1;
+        if self.consume(b'0') {
+            if matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(self.error("leading zero in JSON number"));
+            }
+        } else {
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.position += 1;
+            }
         }
         let text = std::str::from_utf8(&self.bytes[start..self.position])
             .map_err(|_| self.error("invalid JSON number"))?;
@@ -274,3 +282,85 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse, quote, MAX_NESTING_DEPTH};
+
+    #[test]
+    fn malformed_json_corpus_fails_closed() {
+        for malformed in [
+            "",
+            "[",
+            "{",
+            "[1,]",
+            "{\"a\":1,}",
+            "{\"a\":1,\"a\":2}",
+            "\"unterminated",
+            "\"bad\\xescape\"",
+            "\"bad\\u12x4\"",
+            "01",
+            "-1",
+            "1.5",
+            "null trailing",
+            "\u{0000}",
+        ] {
+            assert!(
+                parse(malformed).is_err(),
+                "accepted malformed JSON: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nesting_bomb_stops_at_the_explicit_depth_limit() {
+        let accepted = format!(
+            "{}null{}",
+            "[".repeat(MAX_NESTING_DEPTH),
+            "]".repeat(MAX_NESTING_DEPTH)
+        );
+        let bomb = format!(
+            "{}null{}",
+            "[".repeat(MAX_NESTING_DEPTH + 2),
+            "]".repeat(MAX_NESTING_DEPTH + 2)
+        );
+
+        assert!(
+            parse(&accepted).is_ok(),
+            "documented nesting boundary must parse"
+        );
+        assert!(parse(&bomb)
+            .expect_err("depth bomb must fail")
+            .to_string()
+            .contains("nesting exceeds limit"));
+    }
+
+    #[test]
+    fn every_truncation_of_a_valid_document_is_rejected() {
+        let document = "{\"state\":[null,true,false,18446744073709551615,\"tail Ω\"]}";
+        assert!(parse(document).is_ok());
+        for end in 0..document.len() {
+            if document.is_char_boundary(end) {
+                assert!(
+                    parse(&document[..end]).is_err(),
+                    "accepted truncated prefix ending at byte {end}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_strings_round_trip_deterministic_edge_characters() {
+        for value in [
+            "",
+            "plain",
+            "quotes \\\"",
+            "line\nfeed",
+            "nul \u{0000}",
+            "Ω🦀",
+        ] {
+            let parsed = parse(&quote(value)).expect("quoted string parses");
+            assert_eq!(parsed, super::Value::String(value.to_owned()));
+        }
+    }
+}

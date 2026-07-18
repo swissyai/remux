@@ -14,6 +14,8 @@ use std::thread::{self, JoinHandle};
 use crate::state::PendingScrollback;
 
 const SEGMENT_MAGIC: &[u8; 4] = b"RMS2";
+const MAX_SEGMENT_RECORDS: u32 = 256;
+const MAX_RECORD_BYTES: usize = 4_096;
 
 pub struct ScrollbackWriter {
     sender: Option<Sender<Request>>,
@@ -158,6 +160,9 @@ fn append_records(
         }
         let count = u32::try_from(records.len())
             .map_err(|_| invalid_data("scrollback segment has too many records"))?;
+        if count > MAX_SEGMENT_RECORDS {
+            return Err(invalid_data("scrollback segment has too many records"));
+        }
         let file = files
             .get_mut(&session_id)
             .ok_or_else(|| invalid_data("scrollback file missing for session"))?;
@@ -169,6 +174,9 @@ fn append_records(
                 return Err(invalid_data("scrollback record offset is not contiguous"));
             }
             let payload = record.payload.as_bytes();
+            if payload.is_empty() || payload.len() > MAX_RECORD_BYTES {
+                return Err(invalid_data("scrollback payload exceeds segment limit"));
+            }
             let length = u32::try_from(payload.len())
                 .map_err(|_| invalid_data("scrollback payload exceeds segment limit"))?;
             file.write_all(&length.to_le_bytes())?;
@@ -208,15 +216,22 @@ pub fn read_segments(path: &Path, persisted_through: u64) -> io::Result<Vec<Stri
         }
         let start = read_u64(&mut file)?;
         let count = read_u32(&mut file)?;
-        if start != expected_offset || count == 0 {
+        let segment_end = start
+            .checked_add(u64::from(count))
+            .ok_or_else(|| invalid_data("scrollback segment offset overflow"))?;
+        if start != expected_offset
+            || count == 0
+            || count > MAX_SEGMENT_RECORDS
+            || segment_end > persisted_through
+        {
             return Err(invalid_data("invalid scrollback segment header"));
         }
         for _ in 0..count {
-            if expected_offset >= persisted_through {
-                return Ok(output);
-            }
             let length = usize::try_from(read_u32(&mut file)?)
                 .map_err(|_| invalid_data("scrollback record length overflow"))?;
+            if length == 0 || length > MAX_RECORD_BYTES {
+                return Err(invalid_data("invalid scrollback record length"));
+            }
             let mut payload = vec![0_u8; length];
             file.read_exact(&mut payload)?;
             output.push(
