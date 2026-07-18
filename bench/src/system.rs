@@ -58,6 +58,15 @@ pub fn descendants(entries: &[ProcessEntry], root_pid: u32) -> BTreeSet<u32> {
     }
 }
 
+/// Returns cumulative CPU seconds for selected processes present in one snapshot.
+pub fn selected_cpu_seconds(entries: &[ProcessEntry], selected: &BTreeSet<u32>) -> f64 {
+    entries
+        .iter()
+        .filter(|entry| selected.contains(&entry.pid))
+        .map(|entry| entry.cpu_seconds)
+        .sum()
+}
+
 #[derive(Default)]
 pub struct ResourceTracker {
     peak_rss_kib: u64,
