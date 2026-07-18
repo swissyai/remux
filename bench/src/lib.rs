@@ -58,6 +58,11 @@ pub struct Percentiles {
     pub p99: u64,
 }
 
+/// Measured 20-tab render scenario with root/child resource separation.
+///
+/// Values come from external process-tree snapshots and flushed-frame timestamps;
+/// construction fails in the harness before a report is emitted when any rail is
+/// violated.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TuiScenarioResult {
     pub model: String,

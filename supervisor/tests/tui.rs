@@ -71,6 +71,21 @@ fn live_batches_show_agent_control_and_keep_a_sanitized_bounded_tail() {
 }
 
 #[test]
+fn invalid_live_batch_fails_before_mutating_any_tab() {
+    let mut view = TracerTabView::live(["session-000"], true).expect("create live tab");
+    let original = view.clone();
+    let mut unknown = event(1, EventKind::Output, "must-not-apply");
+    unknown.session_id = "unknown".to_owned();
+
+    let error = view
+        .apply_batch(&[event(0, EventKind::Status, "partial"), unknown], true)
+        .expect_err("unknown session must reject whole display batch");
+
+    assert!(error.to_string().contains("unknown session"));
+    assert_eq!(view, original);
+}
+
+#[test]
 fn passive_tui_command_renders_without_launching_sessions() {
     let root = PathBuf::from(format!("/tmp/remux-tui-passive-{}", std::process::id()));
     let state_path = root.join("state.json");

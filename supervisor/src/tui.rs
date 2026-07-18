@@ -141,6 +141,11 @@ impl TracerTabView {
     /// Unknown sessions fail without a partial redraw. No I/O occurs here.
     pub fn apply_batch(&mut self, events: &[Event], agent_driving: bool) -> io::Result<()> {
         for event in events {
+            if !self.index_by_session.contains_key(&event.session_id) {
+                return Err(invalid_data("TUI event names unknown session"));
+            }
+        }
+        for event in events {
             let index = *self
                 .index_by_session
                 .get(&event.session_id)
