@@ -14,4 +14,5 @@ pub mod protocol;
 pub mod restore;
 pub mod scrollback;
 pub mod state;
+pub mod trace;
 pub mod tui;

@@ -29,6 +29,7 @@ use supervisor::protocol::{parse_message, unix_micros_now, Control, Event, Event
 use supervisor::restore::inspect_passive;
 use supervisor::scrollback::ScrollbackWriter;
 use supervisor::state::{dump_atomic, restore_passive, LiveState};
+use supervisor::trace::{RecordedTrace, TraceRecord};
 use supervisor::tui::{TracerRenderer, TracerTabView};
 
 const MAX_MESSAGE_BYTES: usize = 4_096;
@@ -54,6 +55,7 @@ fn entrypoint() -> Result<(), Box<dyn std::error::Error>> {
         Some("verify-attestation") => {
             verify_attestation_command(VerifyAttestationConfig::parse(arguments)?)
         }
+        Some("capture-trace") => capture_trace(CaptureTraceConfig::parse(arguments)?),
         _ => Err(usage().into()),
     }
 }
@@ -363,6 +365,59 @@ fn render_restore(config: TuiConfig) -> Result<(), Box<dyn std::error::Error>> {
     let view = TracerTabView::from_passive(&state)?;
     let mut renderer = TracerRenderer::new(config.target.open()?, view);
     renderer.redraw()?;
+    Ok(())
+}
+
+fn capture_trace(config: CaptureTraceConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let lifecycle = consume_lifecycle_authorization(
+        &config.auth_log,
+        AttachScope::Launch,
+        Some(&config.attach_token),
+        ["capture"],
+    )?;
+    prepare_output(&config.output)?;
+    let captured_unix_micros = unix_micros_now()?;
+    let mut command = Command::new("/bin/sh");
+    command.args(["-lc", &config.command]);
+    let (mut child, master) = spawn_authorized_pty(&lifecycle, "capture", &mut command)?;
+    let origin = Instant::now();
+    let mut reader = BufReader::new(master);
+    let mut records = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let bytes = match reader.read_until(b'\n', &mut line) {
+            Ok(bytes) => bytes,
+            Err(error) if error.raw_os_error() == Some(5) => break,
+            Err(error) => return Err(error.into()),
+        };
+        if bytes == 0 {
+            break;
+        }
+        while line
+            .last()
+            .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let at_micros = u64::try_from(origin.elapsed().as_micros())?;
+        records.push(TraceRecord::new(at_micros, line)?);
+    }
+    let status = child.wait()?;
+    let exit_code = status
+        .code()
+        .ok_or_else(|| format!("working-session capture ended with {status}"))?;
+    let trace =
+        RecordedTrace::from_capture(captured_unix_micros, &config.command, exit_code, records)?;
+    trace.write_atomic(&config.output)?;
+    println!(
+        "captured\t{}\nrecords\t{}\ncommand_sha256\t{}",
+        config.output.display(),
+        trace.records().len(),
+        trace.command_sha256()
+    );
     Ok(())
 }
 
@@ -995,6 +1050,43 @@ impl TuiConfig {
     }
 }
 
+struct CaptureTraceConfig {
+    output: PathBuf,
+    command: String,
+    auth_log: PathBuf,
+    attach_token: String,
+}
+
+impl CaptureTraceConfig {
+    fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut output = None;
+        let mut command = None;
+        let mut auth_log = None;
+        let mut attach_token = None;
+        let mut arguments = arguments;
+        while let Some(flag) = arguments.next() {
+            let value = arguments.next().ok_or_else(|| usage().to_owned())?;
+            match flag.as_str() {
+                "--output" => output = Some(PathBuf::from(value)),
+                "--command"
+                    if !value.is_empty() && value.len() <= 4_096 && !value.contains('\n') =>
+                {
+                    command = Some(value);
+                }
+                "--auth-log" => auth_log = Some(PathBuf::from(value)),
+                "--attach-token" => attach_token = Some(value),
+                _ => return Err(usage().to_owned()),
+            }
+        }
+        Ok(Self {
+            output: output.ok_or_else(|| usage().to_owned())?,
+            command: command.ok_or_else(|| usage().to_owned())?,
+            auth_log: auth_log.ok_or_else(|| usage().to_owned())?,
+            attach_token: attach_token.ok_or_else(|| usage().to_owned())?,
+        })
+    }
+}
+
 struct VerifyAttestationConfig {
     file: PathBuf,
 }
@@ -1033,5 +1125,5 @@ fn sibling_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn usage() -> &'static str {
-    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell] [--agent-shell PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--attestation-dir PATH] [--attestation off|hash-chain] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]\n       remux-supervisor verify-attestation --file PATH"
+    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell] [--agent-shell PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--attestation-dir PATH] [--attestation off|hash-chain] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]\n       remux-supervisor verify-attestation --file PATH\n       remux-supervisor capture-trace --output PATH --command COMMAND --auth-log PATH --attach-token TOKEN"
 }
