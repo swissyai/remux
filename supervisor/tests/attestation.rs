@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use supervisor::attach::{
-    consume_lifecycle_authorization, record_authorization, spawn_authorized_pty, AttachScope,
+    consume_lifecycle_authorization, deny_attestation_writes, record_authorization,
+    spawn_authorized_pty, AttachScope,
 };
 use supervisor::attestation::{
     attestation_path, repair_torn_tail, verify_attestation, AttestationWriter, ExitOutcome,
@@ -166,6 +167,42 @@ fn committed_attestation_mutation_fails_hash_verification() {
 }
 
 #[test]
+fn complete_chain_cannot_be_relabelled_as_another_session() {
+    let root = test_root("session-binding");
+    clean_root(&root);
+    let logs = root.join("logs");
+    let observe =
+        observe_sessions(["session-000", "session-001"]).expect("mint two-session observe proof");
+    let writer = AttestationWriter::start(&logs, ["session-000", "session-001"], &observe)
+        .expect("start two-session attestation writer");
+    let observer = writer.observer().expect("mint observer");
+    observer
+        .lifecycle("session-000", LifecyclePhase::Created)
+        .expect("record first session");
+    observer
+        .lifecycle("session-001", LifecyclePhase::Created)
+        .expect("record second session");
+    drop(observer);
+    writer.finish().expect("finish session-bound logs");
+    let first = attestation_path(&logs, "session-000");
+    let second = attestation_path(&logs, "session-001");
+    let first_bytes = fs::read(&first).expect("read first session chain");
+    let second_bytes = fs::read(&second).expect("read second session chain");
+    fs::set_permissions(&first, fs::Permissions::from_mode(0o600)).expect("open first swap seam");
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o600)).expect("open second swap seam");
+    fs::write(&first, second_bytes).expect("swap second chain onto first path");
+    fs::write(&second, first_bytes).expect("swap first chain onto second path");
+    fs::set_permissions(&first, fs::Permissions::from_mode(0o400)).expect("protect first swap");
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o400)).expect("protect second swap");
+
+    for path in [&first, &second] {
+        let error = verify_attestation(path).expect_err("relabeled session chain must fail");
+        assert!(error.to_string().contains("session identity differs"));
+    }
+    clean_root(&root);
+}
+
+#[test]
 fn agent_inside_authorized_pty_cannot_append_its_own_attestation() {
     let root = test_root("agent-write");
     clean_root(&root);
@@ -193,8 +230,10 @@ fn agent_inside_authorized_pty_cannot_append_its_own_attestation() {
     let mut command = Command::new("/bin/sh");
     command.env("REMUX_ATTESTATION_PATH", &path).args([
         "-c",
-        "printf forged >> \"$REMUX_ATTESTATION_PATH\"; printf observed-output",
+        "chmod 600 \"$REMUX_ATTESTATION_PATH\"; printf forged >> \"$REMUX_ATTESTATION_PATH\"; printf observed-output",
     ]);
+    let mut command =
+        deny_attestation_writes(&command, &logs).expect("sandbox hostile attested agent");
     let (mut child, mut master) = spawn_authorized_pty(&lifecycle, "session-000", &mut command)
         .expect("spawn hostile agent only through lifecycle route");
     observer
@@ -223,7 +262,7 @@ fn agent_inside_authorized_pty_cannot_append_its_own_attestation() {
     let summary = writer.finish().expect("finish protected attestation");
 
     assert!(status.success());
-    assert!(String::from_utf8_lossy(&output).contains("Permission denied"));
+    assert!(String::from_utf8_lossy(&output).contains("Operation not permitted"));
     let file = fs::read(&path).expect("read protected chain");
     assert!(!file
         .windows(b"forged".len())
@@ -231,6 +270,14 @@ fn agent_inside_authorized_pty_cannot_append_its_own_attestation() {
     let verified = verify_attestation(&path).expect("agent attempt left valid chain");
     assert_eq!(verified.head, summary["session-000"].head);
     assert_eq!(verified.output_bytes, output.len() as u64);
+    assert_eq!(
+        fs::metadata(&path)
+            .expect("protected metadata after hostile chmod")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o400
+    );
     assert!(OpenOptions::new().append(true).open(&path).is_err());
     let mut append = OpenOptions::new();
     append.append(true);

@@ -15,8 +15,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use supervisor::attach::{
-    consume_drive_authorization, consume_lifecycle_authorization, record_authorization,
-    record_drive_authorization, spawn_authorized_pty, AttachScope,
+    consume_drive_authorization, consume_lifecycle_authorization, deny_attestation_writes,
+    record_authorization, record_drive_authorization, spawn_authorized_pty, AttachScope,
 };
 use supervisor::attestation::{
     attestation_path, verify_attestation, AttestationObserver, AttestationSummary,
@@ -176,6 +176,11 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                     "--start-delay-us",
                     &start_delay_us.to_string(),
                 ]);
+                let mut command = protect_attestation_command(
+                    &command,
+                    &config.attestation_dir,
+                    attestation_observer.is_some(),
+                )?;
                 let (child, master) = spawn_authorized_pty(&lifecycle, session_id, &mut command)?;
                 record_attested_spawn(&attestation_observer, session_id, child.id())?;
                 children.push(child);
@@ -188,6 +193,11 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
             AgentKind::RealShell => {
                 let mut command = Command::new(&config.agent_shell);
                 command.args(["-c", REAL_AGENT_SCRIPT]);
+                let mut command = protect_attestation_command(
+                    &command,
+                    &config.attestation_dir,
+                    attestation_observer.is_some(),
+                )?;
                 let (child, master) = spawn_authorized_pty(&lifecycle, session_id, &mut command)?;
                 record_attested_spawn(&attestation_observer, session_id, child.id())?;
                 let input = master.try_clone()?;
@@ -226,6 +236,11 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                     "--start-delay-us",
                     &start_delay_us.to_string(),
                 ]);
+                let mut command = protect_attestation_command(
+                    &command,
+                    &config.attestation_dir,
+                    attestation_observer.is_some(),
+                )?;
                 let (child, master) = spawn_authorized_pty(&lifecycle, session_id, &mut command)?;
                 record_attested_spawn(&attestation_observer, session_id, child.id())?;
                 let event_socket = UnixStream::connect(&config.socket)?;
@@ -475,6 +490,33 @@ fn verify_attestation_command(
         Ok(())
     } else {
         Err("attestation has a torn final frame".into())
+    }
+}
+
+fn protect_attestation_command(
+    command: &Command,
+    attestation_directory: &Path,
+    enabled: bool,
+) -> io::Result<Command> {
+    if enabled {
+        deny_attestation_writes(command, attestation_directory)
+    } else {
+        let mut unprotected = Command::new(command.get_program());
+        unprotected.args(command.get_args());
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    unprotected.env(key, value);
+                }
+                None => {
+                    unprotected.env_remove(key);
+                }
+            }
+        }
+        if let Some(directory) = command.get_current_dir() {
+            unprotected.current_dir(directory);
+        }
+        Ok(unprotected)
     }
 }
 

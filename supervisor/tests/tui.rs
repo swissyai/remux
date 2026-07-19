@@ -12,13 +12,14 @@ use supervisor::state::{dump_atomic, LiveState};
 use supervisor::tui::{TracerRenderer, TracerTabView};
 
 fn granted_drive(name: &str) -> DrivePresence {
-    let path =
-        std::env::temp_dir().join(format!("remux-tui-drive-{name}-{}.log", std::process::id()));
-    let _ = fs::remove_file(&path);
+    let root = std::env::temp_dir().join(format!("remux-tui-drive-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).expect("create TUI drive fixture");
+    let path = root.join("capabilities.log");
     record_drive_authorization(&path, "tui-drive").expect("record TUI drive grant");
     let capability = consume_drive_authorization(&path, Some("tui-drive"), ["session-000"])
         .expect("consume TUI drive grant");
-    fs::remove_file(path).expect("remove TUI drive fixture");
+    fs::remove_dir_all(root).expect("remove TUI drive fixture");
     capability.presence()
 }
 

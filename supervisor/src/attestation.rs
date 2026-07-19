@@ -230,7 +230,7 @@ impl AttestationWriter {
                 .mode(0o600)
                 .open(&path)?;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
-            logs.insert(session_id, SessionLog::new(file));
+            logs.insert(session_id.clone(), SessionLog::new(file, session_id));
         }
         if requested.is_empty() || requested.len() != observed.len() {
             return Err(invalid_input(
@@ -364,6 +364,7 @@ impl ObservationClock {
 
 struct SessionLog {
     file: File,
+    session_id: String,
     sequence: u64,
     head: [u8; 32],
     input_hasher: Sha256,
@@ -374,9 +375,10 @@ struct SessionLog {
 }
 
 impl SessionLog {
-    fn new(file: File) -> Self {
+    fn new(file: File, session_id: String) -> Self {
         Self {
             file,
+            session_id,
             sequence: 0,
             head: ZERO_HASH,
             input_hasher: Sha256::new(),
@@ -438,6 +440,7 @@ impl SessionLog {
                 PayloadFields::non_byte("exit", &outcome.encode()),
             ),
         };
+        let payload = format!("{}\t{payload}", self.session_id);
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(invalid_data("attestation payload exceeds limit"));
         }
@@ -575,7 +578,12 @@ pub fn verify_attestation(path: &Path) -> io::Result<Verification> {
         return Err(invalid_data("attestation log exceeds size limit"));
     }
     let bytes = fs::read(path)?;
-    verify_bytes(&bytes)
+    let session_id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".attest"))
+        .ok_or_else(|| invalid_data("attestation path has no session identity"))?;
+    verify_bytes(&bytes, session_id)
 }
 
 /// Removes only an incomplete final frame, preserving the verified complete prefix.
@@ -598,7 +606,7 @@ pub fn repair_torn_tail(path: &Path) -> io::Result<Verification> {
     verify_attestation(path)
 }
 
-fn verify_bytes(bytes: &[u8]) -> io::Result<Verification> {
+fn verify_bytes(bytes: &[u8], expected_session_id: &str) -> io::Result<Verification> {
     let mut offset = 0_usize;
     let mut expected_sequence = 0_u64;
     let mut expected_head = ZERO_HASH;
@@ -667,6 +675,7 @@ fn verify_bytes(bytes: &[u8]) -> io::Result<Verification> {
         }
         validate_payload(
             payload,
+            expected_session_id,
             expected_sequence,
             &mut input_bytes,
             &mut output_bytes,
@@ -692,6 +701,7 @@ fn verify_bytes(bytes: &[u8]) -> io::Result<Verification> {
 
 fn validate_payload(
     payload: &[u8],
+    expected_session_id: &str,
     expected_sequence: u64,
     input_bytes: &mut u64,
     output_bytes: &mut u64,
@@ -700,10 +710,14 @@ fn validate_payload(
     let payload = std::str::from_utf8(payload)
         .map_err(|_| invalid_data("attestation payload is not UTF-8"))?;
     let fields = payload.split('\t').collect::<Vec<_>>();
-    let [sequence, monotonic, unix, kind, value, delta, total, content_hash] = fields.as_slice()
+    let [session_id, sequence, monotonic, unix, kind, value, delta, total, content_hash] =
+        fields.as_slice()
     else {
         return Err(invalid_data("invalid attestation payload shape"));
     };
+    if *session_id != expected_session_id {
+        return Err(invalid_data("attestation session identity differs"));
+    }
     if parse_u64(sequence, "sequence")? != expected_sequence {
         return Err(invalid_data("attestation sequence differs"));
     }

@@ -5,9 +5,9 @@
 //! route to PTY process creation; drive proofs cannot spawn processes.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 use crate::capability::{DriveCapability, LifecycleAction, LifecycleCapability};
@@ -125,6 +125,45 @@ pub fn spawn_authorized_pty(
     remux_pty::spawn_pty(command)
 }
 
+/// Rebuilds a command under the macOS sandbox with writes to `directory` denied.
+///
+/// Program, arguments, explicit environment changes, and current directory are
+/// preserved. Standard-I/O configuration is intentionally not accepted; callers
+/// attach the returned command through [`spawn_authorized_pty`]. The function fails
+/// closed when the platform sandbox executable or a canonical directory is absent.
+pub fn deny_attestation_writes(command: &Command, directory: &Path) -> io::Result<Command> {
+    let sandbox = Path::new("/usr/bin/sandbox-exec");
+    if !sandbox.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "attested sessions require /usr/bin/sandbox-exec",
+        ));
+    }
+    let protected = fs::canonicalize(directory)?;
+    let protected = protected
+        .to_str()
+        .ok_or_else(|| invalid_input("attestation directory path is not UTF-8"))?;
+    let escaped = protected.replace('\\', "\\\\").replace('"', "\\\"");
+    let profile = format!("(version 1) (allow default) (deny file-write* (subpath \"{escaped}\"))");
+    let mut wrapped = Command::new(sandbox);
+    wrapped.arg("-p").arg(profile).arg(command.get_program());
+    wrapped.args(command.get_args());
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                wrapped.env(key, value);
+            }
+            None => {
+                wrapped.env_remove(key);
+            }
+        }
+    }
+    if let Some(directory) = command.get_current_dir() {
+        wrapped.current_dir(directory);
+    }
+    Ok(wrapped)
+}
+
 fn consume(log: &Path, scope: &str, action: &str, token: Option<&str>) -> io::Result<()> {
     let Some(token) = token else {
         append_record(log, "refused", scope, "missing-token")?;
@@ -141,6 +180,16 @@ fn consume(log: &Path, scope: &str, action: &str, token: Option<&str>) -> io::Re
             io::ErrorKind::PermissionDenied,
             format!("no unused {scope} authorization for token"),
         ));
+    }
+    if let Err(error) = claim_single_use(log, scope, token) {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            append_record(log, "refused", scope, token)?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{scope} authorization token was already claimed"),
+            ));
+        }
+        return Err(error);
     }
     append_record(log, action, scope, token)
 }
@@ -179,6 +228,22 @@ fn authorization_counts(
         }
     }
     Ok((grants, uses))
+}
+
+fn claim_single_use(log: &Path, scope: &str, token: &str) -> io::Result<()> {
+    let path = claim_path(log, scope, token)?;
+    let mut claim = OpenOptions::new().create_new(true).write(true).open(path)?;
+    writeln!(claim, "claimed\t{scope}\t{token}")?;
+    claim.sync_all()?;
+    File::open(log.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+}
+
+fn claim_path(log: &Path, scope: &str, token: &str) -> io::Result<PathBuf> {
+    let file_name = log
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid_input("authorization log needs a UTF-8 file name"))?;
+    Ok(log.with_file_name(format!(".{file_name}.claim-{scope}-{token}")))
 }
 
 fn append_record(log: &Path, action: &str, scope: &str, token: &str) -> io::Result<()> {

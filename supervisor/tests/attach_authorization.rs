@@ -10,14 +10,16 @@ use supervisor::attach::{
 };
 use supervisor::capability::{CapabilityTier, DrivePresence, ROUTE_DECLARATIONS};
 
-fn test_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("remux-auth-{name}-{}.log", std::process::id()))
+fn test_root(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("remux-auth-{name}-{}", std::process::id()))
 }
 
 #[test]
 fn drive_and_lifecycle_each_consume_one_explicit_logged_authorization() {
-    let path = test_path("exact-tiers");
-    let _ = fs::remove_file(&path);
+    let root = test_root("exact-tiers");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).expect("create authorization fixture");
+    let path = root.join("capabilities.log");
 
     let refused =
         consume_lifecycle_authorization(&path, AttachScope::Relaunch, None, ["session-000"])
@@ -60,7 +62,38 @@ fn drive_and_lifecycle_each_consume_one_explicit_logged_authorization() {
     assert!(log.contains("attached\trelaunch\tlifecycle-token"));
     assert!(log.contains("authorized\tdrive\tdrive-token"));
     assert!(log.contains("driving\tdrive\tdrive-token"));
-    fs::remove_file(path).expect("remove authorization log fixture");
+    fs::remove_dir_all(root).expect("remove authorization fixture");
+}
+
+#[test]
+fn concurrent_consumers_cannot_both_claim_one_drive_token() {
+    let root = test_root("concurrent-claim");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).expect("create concurrent authorization fixture");
+    let path = root.join("capabilities.log");
+    record_drive_authorization(&path, "one-use").expect("record one drive grant");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let path = path.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            consume_drive_authorization(&path, Some("one-use"), ["session-000"])
+        }));
+    }
+    barrier.wait();
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("authorization worker did not panic"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let log = fs::read_to_string(&path).expect("read concurrent authorization log");
+    assert_eq!(log.matches("driving\tdrive\tone-use").count(), 1);
+    assert_eq!(log.matches("refused\tdrive\tone-use").count(), 1);
+    fs::remove_dir_all(root).expect("remove concurrent authorization fixture");
 }
 
 #[test]
