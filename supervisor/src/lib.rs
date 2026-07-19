@@ -6,6 +6,7 @@
 //! in-memory state and persists a passive schema that has no executable fields.
 
 pub mod attach;
+pub mod capability;
 mod json;
 pub mod protocol;
 pub mod restore;

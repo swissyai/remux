@@ -4,34 +4,95 @@
 use std::fs;
 use std::path::PathBuf;
 
-use supervisor::attach::{consume_authorization, record_authorization, AttachScope};
+use supervisor::attach::{
+    consume_drive_authorization, consume_lifecycle_authorization, record_authorization,
+    record_drive_authorization, AttachScope,
+};
+use supervisor::capability::{CapabilityTier, DrivePresence, ROUTE_DECLARATIONS};
 
 fn test_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("remux-auth-{name}-{}.log", std::process::id()))
 }
 
 #[test]
-fn relaunch_consumes_one_explicit_logged_authorization() {
-    let path = test_path("relaunch");
+fn drive_and_lifecycle_each_consume_one_explicit_logged_authorization() {
+    let path = test_path("exact-tiers");
     let _ = fs::remove_file(&path);
 
-    let refused = consume_authorization(&path, AttachScope::Relaunch, None)
-        .expect_err("missing token must refuse relaunch");
+    let refused =
+        consume_lifecycle_authorization(&path, AttachScope::Relaunch, None, ["session-000"])
+            .expect_err("missing token must refuse relaunch");
     assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
 
-    record_authorization(&path, AttachScope::Relaunch, "test-token")
-        .expect("record explicit authorization");
-    let permit = consume_authorization(&path, AttachScope::Relaunch, Some("test-token"))
-        .expect("consume explicit authorization");
-    assert_eq!(permit.scope(), AttachScope::Relaunch);
-
-    let reused = consume_authorization(&path, AttachScope::Relaunch, Some("test-token"))
-        .expect_err("authorization token must be single-use");
+    record_authorization(&path, AttachScope::Relaunch, "lifecycle-token")
+        .expect("record explicit lifecycle authorization");
+    let lifecycle = consume_lifecycle_authorization(
+        &path,
+        AttachScope::Relaunch,
+        Some("lifecycle-token"),
+        ["session-000"],
+    )
+    .expect("consume explicit lifecycle authorization");
+    assert_eq!(
+        lifecycle.action(),
+        supervisor::capability::LifecycleAction::Relaunch
+    );
+    let reused = consume_lifecycle_authorization(
+        &path,
+        AttachScope::Relaunch,
+        Some("lifecycle-token"),
+        ["session-000"],
+    )
+    .expect_err("lifecycle authorization token must be single-use");
     assert_eq!(reused.kind(), std::io::ErrorKind::PermissionDenied);
 
-    let log = fs::read_to_string(&path).expect("read authorization audit log");
+    record_drive_authorization(&path, "drive-token").expect("record explicit drive authorization");
+    let drive = consume_drive_authorization(&path, Some("drive-token"), ["session-000"])
+        .expect("consume explicit drive authorization");
+    assert!(drive.presence().is_driven("session-000"));
+    let reused = consume_drive_authorization(&path, Some("drive-token"), ["session-000"])
+        .expect_err("drive authorization token must be single-use");
+    assert_eq!(reused.kind(), std::io::ErrorKind::PermissionDenied);
+
+    let log = fs::read_to_string(&path).expect("read capability authorization audit log");
     assert!(log.contains("refused\trelaunch\tmissing-token"));
-    assert!(log.contains("authorized\trelaunch\ttest-token"));
-    assert!(log.contains("attached\trelaunch\ttest-token"));
+    assert!(log.contains("authorized\trelaunch\tlifecycle-token"));
+    assert!(log.contains("attached\trelaunch\tlifecycle-token"));
+    assert!(log.contains("authorized\tdrive\tdrive-token"));
+    assert!(log.contains("driving\tdrive\tdrive-token"));
     fs::remove_file(path).expect("remove authorization log fixture");
+}
+
+#[test]
+fn route_inventory_declares_one_exact_tier_and_no_implicit_broadening() {
+    let names = ROUTE_DECLARATIONS
+        .iter()
+        .map(|route| route.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(names.len(), ROUTE_DECLARATIONS.len());
+    assert_eq!(
+        ROUTE_DECLARATIONS
+            .iter()
+            .filter(|route| route.tier == CapabilityTier::Observe)
+            .count(),
+        2
+    );
+    assert_eq!(
+        ROUTE_DECLARATIONS
+            .iter()
+            .filter(|route| route.tier == CapabilityTier::Drive)
+            .count(),
+        2
+    );
+    assert_eq!(
+        ROUTE_DECLARATIONS
+            .iter()
+            .filter(|route| route.tier == CapabilityTier::Lifecycle)
+            .count(),
+        1
+    );
+    assert!(
+        !DrivePresence::none().is_driven("session-000"),
+        "positive drive state must require a drive proof"
+    );
 }

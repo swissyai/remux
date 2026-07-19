@@ -315,7 +315,9 @@ fn run_supervisor_baseline(
     let ready = temporary.path.join("ready.tsv");
     let auth_log = temporary.path.join("attach.log");
     let auth_token = format!("bench-{}-{}", agent.argument(), std::process::id());
-    authorize(supervisor, &auth_log, &auth_token)?;
+    let drive_token = format!("bench-drive-{}-{}", agent.argument(), std::process::id());
+    authorize(supervisor, &auth_log, &auth_token, "launch")?;
+    authorize(supervisor, &auth_log, &drive_token, "drive")?;
     let mut child = Command::new(supervisor)
         .args([
             "run",
@@ -347,6 +349,8 @@ fn run_supervisor_baseline(
             &auth_token,
             "--attach-scope",
             "launch",
+            "--drive-token",
+            &drive_token,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -465,7 +469,9 @@ fn run_tui_baseline(
     let auth_log = temporary.path.join("attach.log");
     let tui_output = temporary.path.join("tui.ansi");
     let auth_token = format!("bench-tui-{}", std::process::id());
-    authorize(supervisor, &auth_log, &auth_token)?;
+    let drive_token = format!("bench-tui-drive-{}", std::process::id());
+    authorize(supervisor, &auth_log, &auth_token, "launch")?;
+    authorize(supervisor, &auth_log, &drive_token, "drive")?;
     let timeout_seconds = TUI_INITIAL_IDLE_MS
         .div_ceil(1_000)
         .saturating_add(config.supervisor_timeout_seconds())
@@ -501,6 +507,8 @@ fn run_tui_baseline(
             &auth_token,
             "--attach-scope",
             "launch",
+            "--drive-token",
+            &drive_token,
             "--initial-idle-ms",
             &TUI_INITIAL_IDLE_MS.to_string(),
             "--tui-output",
@@ -711,6 +719,7 @@ fn authorize(
     supervisor: &Path,
     auth_log: &Path,
     auth_token: &str,
+    scope: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let authorization = Command::new(supervisor)
         .args([
@@ -720,7 +729,7 @@ fn authorize(
             "--token",
             auth_token,
             "--scope",
-            "launch",
+            scope,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

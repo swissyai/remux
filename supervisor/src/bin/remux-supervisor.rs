@@ -14,8 +14,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use supervisor::attach::{
-    consume_authorization, record_authorization, spawn_authorized_pty, AttachScope,
+    consume_drive_authorization, consume_lifecycle_authorization, record_authorization,
+    record_drive_authorization, spawn_authorized_pty, AttachScope,
 };
+use supervisor::capability::{write_authorized_input, DriveCapability, DrivePresence};
 use supervisor::protocol::{parse_message, unix_micros_now, Control, Event, EventKind, Message};
 use supervisor::restore::inspect_passive;
 use supervisor::scrollback::ScrollbackWriter;
@@ -47,17 +49,40 @@ fn entrypoint() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn authorize(config: AuthorizeConfig) -> Result<(), Box<dyn std::error::Error>> {
-    record_authorization(&config.auth_log, config.scope, &config.token)?;
-    println!("authorized {} attach", config.scope);
+    match config.scope {
+        AuthorizationScope::Drive => {
+            record_drive_authorization(&config.auth_log, &config.token)?;
+            println!("authorized drive capability");
+        }
+        AuthorizationScope::Lifecycle(scope) => {
+            record_authorization(&config.auth_log, scope, &config.token)?;
+            println!("authorized {scope} lifecycle capability");
+        }
+    }
     Ok(())
 }
 
 fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let authorization = consume_authorization(
+    let session_ids = (0..config.sessions)
+        .map(|index| format!("session-{index:03}"))
+        .collect::<Vec<_>>();
+    let lifecycle = consume_lifecycle_authorization(
         &config.auth_log,
         config.attach_scope,
         config.attach_token.as_deref(),
+        session_ids.iter().cloned(),
     )?;
+    let drive = match config.drive_token.as_deref() {
+        Some(token) => Some(Arc::new(consume_drive_authorization(
+            &config.auth_log,
+            Some(token),
+            session_ids.iter().cloned(),
+        )?)),
+        None => None,
+    };
+    let drive_presence = drive
+        .as_deref()
+        .map_or_else(DrivePresence::none, DriveCapability::presence);
     prepare_output(&config.socket)?;
     prepare_output(&config.ready_file)?;
     prepare_output(&config.metrics_file)?;
@@ -67,14 +92,11 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver) = mpsc::channel();
     let listener_thread = spawn_listener(listener, Arc::clone(&stopping), sender);
 
-    let session_ids = (0..config.sessions)
-        .map(|index| format!("session-{index:03}"))
-        .collect::<Vec<_>>();
     let mut state = LiveState::new(session_ids.iter().cloned())?;
     let mut renderer = match &config.tui_target {
         Some(target) => Some(TracerRenderer::new(
             target.open()?,
-            TracerTabView::live(session_ids.iter(), true)?,
+            TracerTabView::live(session_ids.iter(), &drive_presence)?,
         )),
         None => None,
     };
@@ -114,18 +136,25 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                     "--start-delay-us",
                     &start_delay_us.to_string(),
                 ]);
-                let (child, master) = spawn_authorized_pty(&authorization, &mut command)?;
+                let (child, master) = spawn_authorized_pty(&lifecycle, session_id, &mut command)?;
                 children.push(child);
                 pty_readers.push(spawn_pty_drain(master));
             }
             AgentKind::RealShell => {
                 let mut command = Command::new(&config.agent_shell);
                 command.args(["-c", REAL_AGENT_SCRIPT]);
-                let (child, master) = spawn_authorized_pty(&authorization, &mut command)?;
+                let (child, master) = spawn_authorized_pty(&lifecycle, session_id, &mut command)?;
                 let input = master.try_clone()?;
                 let event_socket = UnixStream::connect(&config.socket)?;
+                let drive = Arc::clone(
+                    drive
+                        .as_ref()
+                        .ok_or("real-shell input requires an explicit drive capability")?,
+                );
                 pty_writers.push(spawn_real_agent_input(
                     input,
+                    session_id.clone(),
+                    drive,
                     config.events_per_session,
                     interval_us,
                     start_delay_us,
@@ -202,7 +231,7 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
             let pending = state.apply_batch(&events)?;
             scrollback.enqueue(pending)?;
             if let Some(renderer) = &mut renderer {
-                renderer.view_mut().apply_batch(&events, true)?;
+                renderer.view_mut().apply_batch(&events, &drive_presence)?;
                 renderer.redraw()?;
                 let redrawn = unix_micros_now()?;
                 redraw_latencies_us.extend(
@@ -358,6 +387,8 @@ fn spawn_pty_drain(mut master: File) -> JoinHandle<io::Result<u64>> {
 
 fn spawn_real_agent_input(
     mut master: File,
+    session_id: String,
+    drive: Arc<DriveCapability>,
     events: u64,
     interval_us: u64,
     start_delay_us: u64,
@@ -375,11 +406,10 @@ fn spawn_real_agent_input(
                 ))
                 .ok_or_else(|| io::Error::other("real agent schedule overflow"))?;
             sleep_until(scheduled);
-            writeln!(master, "shell-output-{sequence:03}")?;
-            master.flush()?;
+            let input = format!("shell-output-{sequence:03}\n");
+            write_authorized_input(&drive, &session_id, &mut master, input.as_bytes())?;
         }
-        writeln!(master, "__remux_done__")?;
-        master.flush()
+        write_authorized_input(&drive, &session_id, &mut master, b"__remux_done__\n")
     })
 }
 
@@ -572,6 +602,7 @@ struct RunConfig {
     auth_log: PathBuf,
     attach_token: Option<String>,
     attach_scope: AttachScope,
+    drive_token: Option<String>,
     initial_idle_ms: u64,
     tui_target: Option<TuiTarget>,
 }
@@ -593,6 +624,7 @@ impl RunConfig {
         let mut auth_log = PathBuf::from("remux-attach.log");
         let mut attach_token = None;
         let mut attach_scope = AttachScope::Launch;
+        let mut drive_token = None;
         let mut initial_idle_ms = 0;
         let mut tui_target = None;
         let mut arguments = arguments;
@@ -622,6 +654,7 @@ impl RunConfig {
                 "--auth-log" => auth_log = PathBuf::from(value),
                 "--attach-token" => attach_token = Some(value),
                 "--attach-scope" => attach_scope = AttachScope::parse(&value)?,
+                "--drive-token" => drive_token = Some(value),
                 "--initial-idle-ms" => {
                     initial_idle_ms = value.parse().map_err(|_| "invalid initial-idle-ms")?;
                 }
@@ -645,16 +678,33 @@ impl RunConfig {
             auth_log,
             attach_token,
             attach_scope,
+            drive_token,
             initial_idle_ms,
             tui_target,
         })
     }
 }
 
+#[derive(Clone, Copy)]
+enum AuthorizationScope {
+    Drive,
+    Lifecycle(AttachScope),
+}
+
+impl AuthorizationScope {
+    fn parse(value: &str) -> io::Result<Self> {
+        if value == "drive" {
+            Ok(Self::Drive)
+        } else {
+            AttachScope::parse(value).map(Self::Lifecycle)
+        }
+    }
+}
+
 struct AuthorizeConfig {
     auth_log: PathBuf,
     token: String,
-    scope: AttachScope,
+    scope: AuthorizationScope,
 }
 
 impl AuthorizeConfig {
@@ -670,7 +720,7 @@ impl AuthorizeConfig {
             match flag.as_str() {
                 "--auth-log" => auth_log = Some(PathBuf::from(value)),
                 "--token" => token = Some(value),
-                "--scope" => scope = Some(AttachScope::parse(&value)?),
+                "--scope" => scope = Some(AuthorizationScope::parse(&value)?),
                 _ => return Err(format!("unknown flag {flag}").into()),
             }
         }
@@ -764,5 +814,5 @@ fn sibling_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn usage() -> &'static str {
-    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell] [--agent-shell PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]"
+    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell] [--agent-shell PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]"
 }

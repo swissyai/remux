@@ -5,9 +5,22 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use supervisor::attach::{consume_drive_authorization, record_drive_authorization};
+use supervisor::capability::{DrivePresence, ROUTE_DECLARATIONS};
 use supervisor::protocol::{Event, EventKind};
 use supervisor::state::{dump_atomic, LiveState};
 use supervisor::tui::{TracerRenderer, TracerTabView};
+
+fn granted_drive(name: &str) -> DrivePresence {
+    let path =
+        std::env::temp_dir().join(format!("remux-tui-drive-{name}-{}.log", std::process::id()));
+    let _ = fs::remove_file(&path);
+    record_drive_authorization(&path, "tui-drive").expect("record TUI drive grant");
+    let capability = consume_drive_authorization(&path, Some("tui-drive"), ["session-000"])
+        .expect("consume TUI drive grant");
+    fs::remove_file(path).expect("remove TUI drive fixture");
+    capability.presence()
+}
 
 fn event(sequence: u64, kind: EventKind, payload: &str) -> Event {
     Event {
@@ -45,6 +58,22 @@ fn twenty_restored_tabs_render_visibly_detached_in_one_strip() {
 }
 
 #[test]
+fn live_session_stays_non_driving_until_drive_grant_is_held() {
+    let mut view = TracerTabView::live(["session-000"], &DrivePresence::none())
+        .expect("create lifecycle-only live tab");
+    view.apply_batch(
+        &[event(0, EventKind::Status, "ready")],
+        &DrivePresence::none(),
+    )
+    .expect("apply observed state without drive grant");
+
+    let frame = view.render_ansi();
+
+    assert!(frame.contains("LIVE"));
+    assert!(!frame.contains("AGENT DRIVING"));
+}
+
+#[test]
 fn live_batches_show_agent_control_and_keep_a_sanitized_bounded_tail() {
     let passive = LiveState::new(["session-000"])
         .expect("create one passive session")
@@ -55,7 +84,7 @@ fn live_batches_show_agent_control_and_keep_a_sanitized_bounded_tail() {
         (0..12).map(|index| event(index + 1, EventKind::Output, &format!("tail-{index:03}"))),
     );
 
-    view.apply_batch(&events, true)
+    view.apply_batch(&events, &granted_drive("live-batch"))
         .expect("apply live display batch");
     let frame = view.render_ansi();
 
@@ -72,13 +101,14 @@ fn live_batches_show_agent_control_and_keep_a_sanitized_bounded_tail() {
 
 #[test]
 fn invalid_live_batch_fails_before_mutating_any_tab() {
-    let mut view = TracerTabView::live(["session-000"], true).expect("create live tab");
+    let drive = granted_drive("invalid-batch");
+    let mut view = TracerTabView::live(["session-000"], &drive).expect("create live tab");
     let original = view.clone();
     let mut unknown = event(1, EventKind::Output, "must-not-apply");
     unknown.session_id = "unknown".to_owned();
 
     let error = view
-        .apply_batch(&[event(0, EventKind::Status, "partial"), unknown], true)
+        .apply_batch(&[event(0, EventKind::Status, "partial"), unknown], &drive)
         .expect_err("unknown session must reject whole display batch");
 
     assert!(error.to_string().contains("unknown session"));
@@ -120,7 +150,8 @@ fn passive_tui_command_renders_without_launching_sessions() {
 
 #[test]
 fn renderer_writes_only_on_explicit_redraw() {
-    let view = TracerTabView::live(["session-000"], true).expect("create live tab");
+    let drive = granted_drive("explicit-redraw");
+    let view = TracerTabView::live(["session-000"], &drive).expect("create live tab");
     let mut renderer = TracerRenderer::new(Vec::new(), view);
 
     assert_eq!(renderer.frames_rendered(), 0);
@@ -140,6 +171,7 @@ fn render_module_has_no_process_attach_or_timer_capability() {
         "spawn_authorized_pty",
         "consume_authorization",
         "record_authorization",
+        "record_drive_authorization",
         concat!("thread::", "sleep"),
         "recv_timeout",
         "poll(",
@@ -149,4 +181,7 @@ fn render_module_has_no_process_attach_or_timer_capability() {
             "render module holds forbidden capability: {forbidden}"
         );
     }
+    assert!(ROUTE_DECLARATIONS
+        .iter()
+        .any(|route| route.name == "drive-presence"));
 }

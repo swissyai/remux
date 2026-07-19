@@ -54,6 +54,7 @@ fn real_shell_events_cross_one_socket_with_measured_zero_event_forks() {
     let metrics = root.join("metrics.tsv");
     let ready = root.join("ready.tsv");
     authorize(&auth, "real-e2e", "launch");
+    authorize(&auth, "real-e2e-drive", "drive");
 
     let mut child = Command::new(supervisor_binary())
         .args([
@@ -82,6 +83,8 @@ fn real_shell_events_cross_one_socket_with_measured_zero_event_forks() {
             "real-e2e",
             "--attach-scope",
             "launch",
+            "--drive-token",
+            "real-e2e-drive",
             "--timeout-seconds",
             "5",
         ])
@@ -127,6 +130,8 @@ fn real_shell_events_cross_one_socket_with_measured_zero_event_forks() {
     let audit = fs::read_to_string(&auth).expect("read attach audit");
     assert!(audit.contains("authorized\tlaunch\treal-e2e"));
     assert!(audit.contains("attached\tlaunch\treal-e2e"));
+    assert!(audit.contains("authorized\tdrive\treal-e2e-drive"));
+    assert!(audit.contains("driving\tdrive\treal-e2e-drive"));
     fs::remove_dir_all(root).expect("remove real-agent fixture");
 }
 

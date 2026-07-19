@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 
+use crate::capability::DrivePresence;
 use crate::protocol::{Event, EventKind};
 use crate::state::PersistedState;
 
@@ -59,7 +60,7 @@ impl TracerTabView {
                 )
             }),
             ConnectionState::Detached,
-            false,
+            &DrivePresence::none(),
         )
     }
 
@@ -68,7 +69,7 @@ impl TracerTabView {
     ///
     /// This function only records presentation state; it cannot launch or attach.
     /// It fails for an empty, oversized, invalid, or duplicate session set.
-    pub fn live<I, S>(session_ids: I, agent_driving: bool) -> io::Result<Self>
+    pub fn live<I, S>(session_ids: I, drive: &DrivePresence) -> io::Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -78,14 +79,14 @@ impl TracerTabView {
                 .into_iter()
                 .map(|session_id| (session_id, "starting", &[] as &[String])),
             ConnectionState::Live,
-            agent_driving,
+            drive,
         )
     }
 
     fn from_sessions<'a, I, S, T>(
         sessions: I,
         connection: ConnectionState,
-        agent_driving: bool,
+        drive: &DrivePresence,
     ) -> io::Result<Self>
     where
         I: IntoIterator<Item = (S, T, &'a [String])>,
@@ -122,7 +123,7 @@ impl TracerTabView {
                 status: display_text(status.as_ref(), MAX_STATUS_CHARS),
                 tail,
                 connection,
-                agent_driving,
+                agent_driving: drive.is_driven(session_id),
             });
         }
         if tabs.is_empty() {
@@ -137,9 +138,9 @@ impl TracerTabView {
 
     /// Applies already-validated live events to presentation state.
     ///
-    /// The caller supplies whether the existing live session is agent-driven.
+    /// The caller supplies a projection derived from held drive capabilities.
     /// Unknown sessions fail without a partial redraw. No I/O occurs here.
-    pub fn apply_batch(&mut self, events: &[Event], agent_driving: bool) -> io::Result<()> {
+    pub fn apply_batch(&mut self, events: &[Event], drive: &DrivePresence) -> io::Result<()> {
         for event in events {
             if !self.index_by_session.contains_key(&event.session_id) {
                 return Err(invalid_data("TUI event names unknown session"));
@@ -155,7 +156,7 @@ impl TracerTabView {
                 .get_mut(index)
                 .ok_or_else(|| invalid_data("TUI tab index is invalid"))?;
             tab.connection = ConnectionState::Live;
-            tab.agent_driving = agent_driving;
+            tab.agent_driving = drive.is_driven(&event.session_id);
             match event.kind {
                 EventKind::Status => {
                     tab.status = display_text(&event.payload, MAX_STATUS_CHARS);
