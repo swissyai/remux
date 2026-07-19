@@ -33,5 +33,12 @@ architecture) live in DOCTRINE.md — read it before designing any wave.
 
 ## Status
 
-Charter stage. Nothing built. See AGENTS.md for the operating rules and the licensing
-decision that must be made before any code is written.
+W4 attested substrate: one resident Rust supervisor owns authorized PTYs, passive
+crash-safe state/scrollback, event-driven tracer tabs, exact observe/drive/lifecycle
+capabilities, and per-session supervisor-observed SHA-256 attestation chains. The
+20-session benchmark publishes RSS/process/latency, idle/render rails, real-trace
+attestation overhead, and an Infinitty baseline in `bench/RESULTS.md`.
+
+Run all build/test/benchmark commands through `scripts/with_scorer_lock.sh`; Cargo is
+forced offline. See `CONTEXT.md` for stable domain terms and `AGENTS.md` for the
+clean-room and engineering rules.

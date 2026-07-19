@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use supervisor::attestation::{attestation_path, verify_attestation, LogIntegrity};
 use supervisor::scrollback::{read_segments, segment_path};
 use supervisor::state::restore_passive;
 
@@ -20,6 +21,15 @@ fn text(path: &Path) -> &str {
 
 fn supervisor_binary() -> &'static str {
     env!("CARGO_BIN_EXE_remux-supervisor")
+}
+
+fn metric_value(metrics: &str, name: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}\t")))
+        .expect("metric is present")
+        .parse()
+        .expect("metric is numeric")
 }
 
 fn authorize(log: &Path, token: &str, scope: &str) {
@@ -51,9 +61,11 @@ fn real_shell_events_cross_one_socket_with_measured_zero_event_forks() {
     let socket = root.join("socket");
     let state = root.join("state.json");
     let scrollback = root.join("scrollback");
+    let attestations = root.join("attestations");
     let metrics = root.join("metrics.tsv");
     let ready = root.join("ready.tsv");
     authorize(&auth, "real-e2e", "launch");
+    authorize(&auth, "real-e2e-drive", "drive");
 
     let mut child = Command::new(supervisor_binary())
         .args([
@@ -72,6 +84,8 @@ fn real_shell_events_cross_one_socket_with_measured_zero_event_forks() {
             text(&state),
             "--scrollback-dir",
             text(&scrollback),
+            "--attestation-dir",
+            text(&attestations),
             "--metrics",
             text(&metrics),
             "--ready",
@@ -82,6 +96,8 @@ fn real_shell_events_cross_one_socket_with_measured_zero_event_forks() {
             "real-e2e",
             "--attach-scope",
             "launch",
+            "--drive-token",
+            "real-e2e-drive",
             "--timeout-seconds",
             "5",
         ])
@@ -107,7 +123,7 @@ fn real_shell_events_cross_one_socket_with_measured_zero_event_forks() {
     );
 
     let metrics_text = fs::read_to_string(&metrics).expect("read supervisor metrics");
-    assert!(metrics_text.contains("schema\t2\n"));
+    assert!(metrics_text.contains("schema\t3\n"));
     assert!(metrics_text.contains("agent_kind\treal-shell\n"));
     assert!(metrics_text.contains("events_ingested\t8\n"));
     assert!(
@@ -127,6 +143,16 @@ fn real_shell_events_cross_one_socket_with_measured_zero_event_forks() {
     let audit = fs::read_to_string(&auth).expect("read attach audit");
     assert!(audit.contains("authorized\tlaunch\treal-e2e"));
     assert!(audit.contains("attached\tlaunch\treal-e2e"));
+    assert!(audit.contains("authorized\tdrive\treal-e2e-drive"));
+    assert!(audit.contains("driving\tdrive\treal-e2e-drive"));
+    let verified = verify_attestation(&attestation_path(&attestations, "session-000"))
+        .expect("verify supervisor-owned real-agent attestation");
+    assert_eq!(verified.integrity, LogIntegrity::Complete);
+    assert_eq!(verified.input_bytes, 8 * 17 + 15);
+    assert_eq!(
+        verified.output_bytes,
+        metric_value(&metrics_text, "pty_bytes")
+    );
     fs::remove_dir_all(root).expect("remove real-agent fixture");
 }
 

@@ -14,6 +14,10 @@ path = "src/bin/remux-supervisor.rs"
 name = "fake-agent"
 path = "src/bin/fake-agent.rs"
 
+[[bin]]
+name = "trace-agent"
+path = "src/bin/trace-agent.rs"
+
 [dependencies]
 # Local syscall seam only; no third-party crates.
 remux-pty = { path = "../pty" }

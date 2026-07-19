@@ -197,7 +197,8 @@ fn restore_rejects_hostile_attach_fields_without_execution_capability() {
         ".spawn(",
         ".exec(",
         "spawn_authorized_pty",
-        "consume_authorization",
+        "consume_lifecycle_authorization",
+        "consume_drive_authorization",
     ] {
         assert!(
             restore_sources

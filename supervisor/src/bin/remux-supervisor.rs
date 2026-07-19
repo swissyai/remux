@@ -6,6 +6,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,12 +15,21 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use supervisor::attach::{
-    consume_authorization, record_authorization, spawn_authorized_pty, AttachScope,
+    consume_drive_authorization, consume_lifecycle_authorization, deny_attestation_writes,
+    record_authorization, record_drive_authorization, spawn_authorized_pty, AttachScope,
+};
+use supervisor::attestation::{
+    attestation_path, verify_attestation, AttestationObserver, AttestationSummary,
+    AttestationWriter, ExitOutcome, LifecyclePhase, LogIntegrity,
+};
+use supervisor::capability::{
+    observe_sessions, write_authorized_input, DriveCapability, DrivePresence,
 };
 use supervisor::protocol::{parse_message, unix_micros_now, Control, Event, EventKind, Message};
 use supervisor::restore::inspect_passive;
 use supervisor::scrollback::ScrollbackWriter;
 use supervisor::state::{dump_atomic, restore_passive, LiveState};
+use supervisor::trace::{RecordedTrace, TraceRecord};
 use supervisor::tui::{TracerRenderer, TracerTabView};
 
 const MAX_MESSAGE_BYTES: usize = 4_096;
@@ -42,22 +52,61 @@ fn entrypoint() -> Result<(), Box<dyn std::error::Error>> {
         Some("dump") => request_dump(DumpConfig::parse(arguments)?),
         Some("restore") => inspect_restore(RestoreConfig::parse(arguments)?),
         Some("tui") => render_restore(TuiConfig::parse(arguments)?),
+        Some("verify-attestation") => {
+            verify_attestation_command(VerifyAttestationConfig::parse(arguments)?)
+        }
+        Some("capture-trace") => capture_trace(CaptureTraceConfig::parse(arguments)?),
         _ => Err(usage().into()),
     }
 }
 
 fn authorize(config: AuthorizeConfig) -> Result<(), Box<dyn std::error::Error>> {
-    record_authorization(&config.auth_log, config.scope, &config.token)?;
-    println!("authorized {} attach", config.scope);
+    match config.scope {
+        AuthorizationScope::Drive => {
+            record_drive_authorization(&config.auth_log, &config.token)?;
+            println!("authorized drive capability");
+        }
+        AuthorizationScope::Lifecycle(scope) => {
+            record_authorization(&config.auth_log, scope, &config.token)?;
+            println!("authorized {scope} lifecycle capability");
+        }
+    }
     Ok(())
 }
 
 fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let authorization = consume_authorization(
+    let session_ids = (0..config.sessions)
+        .map(|index| format!("session-{index:03}"))
+        .collect::<Vec<_>>();
+    if config.agent_kind == AgentKind::TraceReplay {
+        let trace_path = config
+            .trace_file
+            .as_deref()
+            .ok_or("trace-replay requires --trace")?;
+        let trace = RecordedTrace::read(trace_path)?;
+        if trace.records().len() != usize::try_from(config.events_per_session)? {
+            return Err("events-per-session differs from recorded trace count".into());
+        }
+    } else if config.trace_file.is_some() {
+        return Err("--trace requires --agent-kind trace-replay".into());
+    }
+    let lifecycle = consume_lifecycle_authorization(
         &config.auth_log,
         config.attach_scope,
         config.attach_token.as_deref(),
+        session_ids.iter().cloned(),
     )?;
+    let drive = match config.drive_token.as_deref() {
+        Some(token) => Some(Arc::new(consume_drive_authorization(
+            &config.auth_log,
+            Some(token),
+            session_ids.iter().cloned(),
+        )?)),
+        None => None,
+    };
+    let drive_presence = drive
+        .as_deref()
+        .map_or_else(DrivePresence::none, DriveCapability::presence);
     prepare_output(&config.socket)?;
     prepare_output(&config.ready_file)?;
     prepare_output(&config.metrics_file)?;
@@ -67,16 +116,26 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver) = mpsc::channel();
     let listener_thread = spawn_listener(listener, Arc::clone(&stopping), sender);
 
-    let session_ids = (0..config.sessions)
-        .map(|index| format!("session-{index:03}"))
-        .collect::<Vec<_>>();
     let mut state = LiveState::new(session_ids.iter().cloned())?;
     let mut renderer = match &config.tui_target {
         Some(target) => Some(TracerRenderer::new(
             target.open()?,
-            TracerTabView::live(session_ids.iter(), true)?,
+            TracerTabView::live(session_ids.iter(), &drive_presence)?,
         )),
         None => None,
+    };
+    let (attestation_writer, attestation_observer) = match config.attestation_mode {
+        AttestationMode::Off => (None, None),
+        AttestationMode::HashChain => {
+            let observe = observe_sessions(session_ids.iter().cloned())?;
+            let writer = AttestationWriter::start(
+                &config.attestation_dir,
+                session_ids.iter().cloned(),
+                &observe,
+            )?;
+            let observer = writer.observer()?;
+            (Some(writer), Some(observer))
+        }
     };
     let scrollback = ScrollbackWriter::start(&config.scrollback_dir, session_ids.iter().cloned())?;
     let interval_us = u64::from(config.sessions)
@@ -99,6 +158,9 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|stagger| idle.checked_add(stagger))
             })
             .ok_or("start delay overflow")?;
+        if let Some(observer) = &attestation_observer {
+            observer.lifecycle(session_id, LifecyclePhase::Created)?;
+        }
         match config.agent_kind {
             AgentKind::Scripted => {
                 let mut command = Command::new(&config.fake_agent);
@@ -114,18 +176,42 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                     "--start-delay-us",
                     &start_delay_us.to_string(),
                 ]);
-                let (child, master) = spawn_authorized_pty(&authorization, &mut command)?;
+                let mut command = protect_attestation_command(
+                    &command,
+                    &config.attestation_dir,
+                    attestation_observer.is_some(),
+                )?;
+                let (child, master) = spawn_authorized_pty(&lifecycle, session_id, &mut command)?;
+                record_attested_spawn(&attestation_observer, session_id, child.id())?;
                 children.push(child);
-                pty_readers.push(spawn_pty_drain(master));
+                pty_readers.push(spawn_pty_drain(
+                    master,
+                    session_id.clone(),
+                    attestation_observer.clone(),
+                ));
             }
             AgentKind::RealShell => {
                 let mut command = Command::new(&config.agent_shell);
                 command.args(["-c", REAL_AGENT_SCRIPT]);
-                let (child, master) = spawn_authorized_pty(&authorization, &mut command)?;
+                let mut command = protect_attestation_command(
+                    &command,
+                    &config.attestation_dir,
+                    attestation_observer.is_some(),
+                )?;
+                let (child, master) = spawn_authorized_pty(&lifecycle, session_id, &mut command)?;
+                record_attested_spawn(&attestation_observer, session_id, child.id())?;
                 let input = master.try_clone()?;
                 let event_socket = UnixStream::connect(&config.socket)?;
+                let drive = Arc::clone(
+                    drive
+                        .as_ref()
+                        .ok_or("real-shell input requires an explicit drive capability")?,
+                );
                 pty_writers.push(spawn_real_agent_input(
                     input,
+                    session_id.clone(),
+                    drive,
+                    attestation_observer.clone(),
                     config.events_per_session,
                     interval_us,
                     start_delay_us,
@@ -134,6 +220,35 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                     master,
                     event_socket,
                     session_id.clone(),
+                    attestation_observer.clone(),
+                ));
+                children.push(child);
+            }
+            AgentKind::TraceReplay => {
+                let trace = config
+                    .trace_file
+                    .as_deref()
+                    .ok_or("trace-replay requires --trace")?;
+                let mut command = Command::new(&config.trace_agent);
+                command.args([
+                    "--trace",
+                    path_text(trace)?,
+                    "--start-delay-us",
+                    &start_delay_us.to_string(),
+                ]);
+                let mut command = protect_attestation_command(
+                    &command,
+                    &config.attestation_dir,
+                    attestation_observer.is_some(),
+                )?;
+                let (child, master) = spawn_authorized_pty(&lifecycle, session_id, &mut command)?;
+                record_attested_spawn(&attestation_observer, session_id, child.id())?;
+                let event_socket = UnixStream::connect(&config.socket)?;
+                pty_readers.push(spawn_trace_events(
+                    master,
+                    event_socket,
+                    session_id.clone(),
+                    attestation_observer.clone(),
                 ));
                 children.push(child);
             }
@@ -202,7 +317,7 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
             let pending = state.apply_batch(&events)?;
             scrollback.enqueue(pending)?;
             if let Some(renderer) = &mut renderer {
-                renderer.view_mut().apply_batch(&events, true)?;
+                renderer.view_mut().apply_batch(&events, &drive_presence)?;
                 renderer.redraw()?;
                 let redrawn = unix_micros_now()?;
                 redraw_latencies_us.extend(
@@ -228,8 +343,11 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
             .join()
             .map_err(|_| "real agent input writer panicked")??;
     }
-    for child in &mut children {
+    for (session_id, child) in session_ids.iter().zip(&mut children) {
         let status = child.wait()?;
+        if let Some(observer) = &attestation_observer {
+            observer.exit(session_id, exit_outcome(status)?)?;
+        }
         if !status.success() {
             return Err(format!("agent exited with {status}").into());
         }
@@ -240,6 +358,20 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
             .checked_add(reader.join().map_err(|_| "PTY reader panicked")??)
             .ok_or("PTY byte count overflow")?;
     }
+    if let Some(observer) = &attestation_observer {
+        for session_id in &session_ids {
+            observer.lifecycle(session_id, LifecyclePhase::Ended)?;
+        }
+    }
+    drop(attestation_observer);
+    let attestation_summary = match attestation_writer {
+        Some(writer) => {
+            let summary = writer.finish()?;
+            verify_attestation_summary(&config.attestation_dir, &summary)?;
+            Some(summary)
+        }
+        None => None,
+    };
     let offsets = scrollback.finish()?;
     state.mark_scrollback_persisted(&offsets)?;
     dump_atomic(&config.state_file, &state)?;
@@ -255,6 +387,7 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
             latencies_us,
             frames_rendered: renderer.as_ref().map_or(0, TracerRenderer::frames_rendered),
             redraw_latencies_us,
+            attestation_summary,
         },
     )?;
     stopping.store(true, Ordering::Release);
@@ -282,6 +415,145 @@ fn render_restore(config: TuiConfig) -> Result<(), Box<dyn std::error::Error>> {
     let view = TracerTabView::from_passive(&state)?;
     let mut renderer = TracerRenderer::new(config.target.open()?, view);
     renderer.redraw()?;
+    Ok(())
+}
+
+fn capture_trace(config: CaptureTraceConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let lifecycle = consume_lifecycle_authorization(
+        &config.auth_log,
+        AttachScope::Launch,
+        Some(&config.attach_token),
+        ["capture"],
+    )?;
+    prepare_output(&config.output)?;
+    let captured_unix_micros = unix_micros_now()?;
+    let mut command = Command::new("/bin/sh");
+    command.args(["-lc", &config.command]);
+    let (mut child, master) = spawn_authorized_pty(&lifecycle, "capture", &mut command)?;
+    let origin = Instant::now();
+    let mut reader = BufReader::new(master);
+    let mut records = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let bytes = match reader.read_until(b'\n', &mut line) {
+            Ok(bytes) => bytes,
+            Err(error) if error.raw_os_error() == Some(5) => break,
+            Err(error) => return Err(error.into()),
+        };
+        if bytes == 0 {
+            break;
+        }
+        while line
+            .last()
+            .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let at_micros = u64::try_from(origin.elapsed().as_micros())?;
+        records.push(TraceRecord::new(at_micros, line)?);
+    }
+    let status = child.wait()?;
+    let exit_code = status
+        .code()
+        .ok_or_else(|| format!("working-session capture ended with {status}"))?;
+    let trace =
+        RecordedTrace::from_capture(captured_unix_micros, &config.command, exit_code, records)?;
+    trace.write_atomic(&config.output)?;
+    println!(
+        "captured\t{}\nrecords\t{}\ncommand_sha256\t{}",
+        config.output.display(),
+        trace.records().len(),
+        trace.command_sha256()
+    );
+    Ok(())
+}
+
+fn verify_attestation_command(
+    config: VerifyAttestationConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let verification = verify_attestation(&config.file)?;
+    let integrity = match verification.integrity {
+        LogIntegrity::Complete => "complete",
+        LogIntegrity::TornTail => "torn-tail",
+    };
+    println!(
+        "integrity\t{integrity}\nrecords\t{}\ninput_bytes\t{}\noutput_bytes\t{}\nhead\t{}",
+        verification.records,
+        verification.input_bytes,
+        verification.output_bytes,
+        verification.head_hex()
+    );
+    if verification.integrity == LogIntegrity::Complete {
+        Ok(())
+    } else {
+        Err("attestation has a torn final frame".into())
+    }
+}
+
+fn protect_attestation_command(
+    command: &Command,
+    attestation_directory: &Path,
+    enabled: bool,
+) -> io::Result<Command> {
+    if enabled {
+        deny_attestation_writes(command, attestation_directory)
+    } else {
+        let mut unprotected = Command::new(command.get_program());
+        unprotected.args(command.get_args());
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    unprotected.env(key, value);
+                }
+                None => {
+                    unprotected.env_remove(key);
+                }
+            }
+        }
+        if let Some(directory) = command.get_current_dir() {
+            unprotected.current_dir(directory);
+        }
+        Ok(unprotected)
+    }
+}
+
+fn record_attested_spawn(
+    observer: &Option<AttestationObserver>,
+    session_id: &str,
+    pid: u32,
+) -> io::Result<()> {
+    if let Some(observer) = observer {
+        observer.spawn(session_id, pid)?;
+        observer.lifecycle(session_id, LifecyclePhase::Running)?;
+    }
+    Ok(())
+}
+
+fn exit_outcome(status: std::process::ExitStatus) -> io::Result<ExitOutcome> {
+    status
+        .code()
+        .map(ExitOutcome::Code)
+        .or_else(|| status.signal().map(ExitOutcome::Signal))
+        .ok_or_else(|| io::Error::other("child exit has neither code nor signal"))
+}
+
+fn verify_attestation_summary(directory: &Path, summary: &AttestationSummary) -> io::Result<()> {
+    for (session_id, expected) in summary {
+        let verified = verify_attestation(&attestation_path(directory, session_id))?;
+        if verified.integrity != LogIntegrity::Complete
+            || verified.records != expected.records
+            || verified.input_bytes != expected.input_bytes
+            || verified.output_bytes != expected.output_bytes
+            || verified.head != expected.head
+        {
+            return Err(io::Error::other(
+                "finished attestation differs from external verification",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -337,7 +609,11 @@ fn read_stream(stream: UnixStream, sender: mpsc::Sender<io::Result<Message>>) ->
     }
 }
 
-fn spawn_pty_drain(mut master: File) -> JoinHandle<io::Result<u64>> {
+fn spawn_pty_drain(
+    mut master: File,
+    session_id: String,
+    attestation: Option<AttestationObserver>,
+) -> JoinHandle<io::Result<u64>> {
     thread::spawn(move || {
         let mut buffer = [0_u8; 4_096];
         let mut total = 0_u64;
@@ -345,6 +621,9 @@ fn spawn_pty_drain(mut master: File) -> JoinHandle<io::Result<u64>> {
             match master.read(&mut buffer) {
                 Ok(0) => return Ok(total),
                 Ok(bytes) => {
+                    if let Some(observer) = &attestation {
+                        observer.output(&session_id, &buffer[..bytes])?;
+                    }
                     total = total
                         .checked_add(u64::try_from(bytes).map_err(io::Error::other)?)
                         .ok_or_else(|| io::Error::other("PTY byte count overflow"))?;
@@ -356,8 +635,25 @@ fn spawn_pty_drain(mut master: File) -> JoinHandle<io::Result<u64>> {
     })
 }
 
+fn write_attested_input(
+    drive: &DriveCapability,
+    attestation: &Option<AttestationObserver>,
+    session_id: &str,
+    master: &mut File,
+    bytes: &[u8],
+) -> io::Result<()> {
+    write_authorized_input(drive, session_id, master, bytes)?;
+    if let Some(observer) = attestation {
+        observer.input(session_id, bytes)?;
+    }
+    Ok(())
+}
+
 fn spawn_real_agent_input(
     mut master: File,
+    session_id: String,
+    drive: Arc<DriveCapability>,
+    attestation: Option<AttestationObserver>,
     events: u64,
     interval_us: u64,
     start_delay_us: u64,
@@ -375,11 +671,22 @@ fn spawn_real_agent_input(
                 ))
                 .ok_or_else(|| io::Error::other("real agent schedule overflow"))?;
             sleep_until(scheduled);
-            writeln!(master, "shell-output-{sequence:03}")?;
-            master.flush()?;
+            let input = format!("shell-output-{sequence:03}\n");
+            write_attested_input(
+                &drive,
+                &attestation,
+                &session_id,
+                &mut master,
+                input.as_bytes(),
+            )?;
         }
-        writeln!(master, "__remux_done__")?;
-        master.flush()
+        write_attested_input(
+            &drive,
+            &attestation,
+            &session_id,
+            &mut master,
+            b"__remux_done__\n",
+        )
     })
 }
 
@@ -387,6 +694,7 @@ fn spawn_real_agent_events(
     master: File,
     mut socket: UnixStream,
     session_id: String,
+    attestation: Option<AttestationObserver>,
 ) -> JoinHandle<io::Result<u64>> {
     thread::spawn(move || {
         let mut reader = BufReader::new(master);
@@ -402,6 +710,10 @@ fn spawn_real_agent_events(
             if bytes == 0 {
                 return Ok(total);
             }
+            let observed_at = unix_micros_now().map_err(io::Error::other)?;
+            if let Some(observer) = &attestation {
+                observer.output(&session_id, line.as_bytes())?;
+            }
             total = total
                 .checked_add(u64::try_from(bytes).map_err(io::Error::other)?)
                 .ok_or_else(|| io::Error::other("PTY byte count overflow"))?;
@@ -412,7 +724,7 @@ fn spawn_real_agent_events(
             let event = Event {
                 session_id: session_id.clone(),
                 sequence,
-                sent_unix_micros: unix_micros_now().map_err(io::Error::other)?,
+                sent_unix_micros: observed_at,
                 kind: EventKind::Output,
                 payload: payload.to_owned(),
             };
@@ -420,6 +732,62 @@ fn spawn_real_agent_events(
             sequence = sequence
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("real agent event sequence overflow"))?;
+        }
+    })
+}
+
+fn spawn_trace_events(
+    master: File,
+    mut socket: UnixStream,
+    session_id: String,
+    attestation: Option<AttestationObserver>,
+) -> JoinHandle<io::Result<u64>> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(master);
+        let mut total = 0_u64;
+        let mut sequence = 0_u64;
+        loop {
+            let mut line = String::new();
+            let bytes = match reader.read_line(&mut line) {
+                Ok(bytes) => bytes,
+                Err(error) if error.raw_os_error() == Some(5) => return Ok(total),
+                Err(error) => return Err(error),
+            };
+            if bytes == 0 {
+                return Ok(total);
+            }
+            let observed_at = unix_micros_now().map_err(io::Error::other)?;
+            if let Some(observer) = &attestation {
+                observer.output(&session_id, line.as_bytes())?;
+            }
+            total = total
+                .checked_add(u64::try_from(bytes).map_err(io::Error::other)?)
+                .ok_or_else(|| io::Error::other("PTY byte count overflow"))?;
+            let payload = line
+                .trim_end_matches(['\r', '\n'])
+                .chars()
+                .map(|character| {
+                    if matches!(character, '\t' | '\r' | '\n') {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>();
+            if payload.is_empty() {
+                continue;
+            }
+            let event = Event {
+                session_id: session_id.clone(),
+                sequence,
+                sent_unix_micros: observed_at,
+                kind: EventKind::Output,
+                payload,
+            };
+            socket.write_all(event.encode().map_err(io::Error::other)?.as_bytes())?;
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("trace event sequence overflow"))?;
         }
     })
 }
@@ -469,15 +837,18 @@ struct RunMetrics {
     latencies_us: Vec<u64>,
     frames_rendered: u64,
     redraw_latencies_us: Vec<u64>,
+    attestation_summary: Option<AttestationSummary>,
 }
 
 fn write_metrics(path: &Path, metrics: &RunMetrics) -> io::Result<()> {
     let latencies = join_numbers(&metrics.latencies_us);
     let redraw_latencies = join_numbers(&metrics.redraw_latencies_us);
+    let (attestation_enabled, attestation_records, attestation_file_bytes, heads) =
+        attestation_metrics(metrics.attestation_summary.as_ref())?;
     fs::write(
         path,
         format!(
-            "schema\t2\nagent_kind\t{}\nevents_ingested\t{}\nbatches\t{}\nchildren_spawned\t{}\npty_bytes\t{}\non_demand_dumps\t{}\nlatencies_us\t{}\nframes_rendered\t{}\nredraw_latencies_us\t{}\n",
+            "schema\t3\nagent_kind\t{}\nevents_ingested\t{}\nbatches\t{}\nchildren_spawned\t{}\npty_bytes\t{}\non_demand_dumps\t{}\nlatencies_us\t{}\nframes_rendered\t{}\nredraw_latencies_us\t{}\nattestation_enabled\t{}\nattestation_records\t{}\nattestation_file_bytes\t{}\nattestation_heads\t{}\n",
             metrics.agent_kind.as_str(),
             metrics.events_ingested,
             metrics.batches,
@@ -486,9 +857,32 @@ fn write_metrics(path: &Path, metrics: &RunMetrics) -> io::Result<()> {
             metrics.on_demand_dumps,
             latencies,
             metrics.frames_rendered,
-            redraw_latencies
+            redraw_latencies,
+            attestation_enabled,
+            attestation_records,
+            attestation_file_bytes,
+            heads
         ),
     )
+}
+
+fn attestation_metrics(summary: Option<&AttestationSummary>) -> io::Result<(u8, u64, u64, String)> {
+    let Some(summary) = summary else {
+        return Ok((0, 0, 0, String::new()));
+    };
+    let mut records = 0_u64;
+    let mut file_bytes = 0_u64;
+    let mut heads = Vec::with_capacity(summary.len());
+    for (session_id, session) in summary {
+        records = records
+            .checked_add(session.records)
+            .ok_or_else(|| io::Error::other("attestation record metric overflow"))?;
+        file_bytes = file_bytes
+            .checked_add(session.file_bytes)
+            .ok_or_else(|| io::Error::other("attestation byte metric overflow"))?;
+        heads.push(format!("{session_id}:{}", session.head_hex()));
+    }
+    Ok((1, records, file_bytes, heads.join(",")))
 }
 
 fn join_numbers(values: &[u64]) -> String {
@@ -520,9 +914,26 @@ impl Drop for SocketGuard {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttestationMode {
+    Off,
+    HashChain,
+}
+
+impl AttestationMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "off" => Ok(Self::Off),
+            "hash-chain" => Ok(Self::HashChain),
+            _ => Err("attestation must be off or hash-chain".to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentKind {
     Scripted,
     RealShell,
+    TraceReplay,
 }
 
 impl AgentKind {
@@ -530,7 +941,8 @@ impl AgentKind {
         match value {
             "scripted" => Ok(Self::Scripted),
             "real-shell" => Ok(Self::RealShell),
-            _ => Err("agent-kind must be scripted or real-shell".to_owned()),
+            "trace-replay" => Ok(Self::TraceReplay),
+            _ => Err("agent-kind must be scripted, real-shell, or trace-replay".to_owned()),
         }
     }
 
@@ -538,6 +950,7 @@ impl AgentKind {
         match self {
             Self::Scripted => "scripted",
             Self::RealShell => "real-shell",
+            Self::TraceReplay => "trace-replay",
         }
     }
 }
@@ -563,15 +976,20 @@ struct RunConfig {
     socket: PathBuf,
     state_file: PathBuf,
     scrollback_dir: PathBuf,
+    attestation_dir: PathBuf,
+    attestation_mode: AttestationMode,
     metrics_file: PathBuf,
     ready_file: PathBuf,
     fake_agent: PathBuf,
+    trace_agent: PathBuf,
+    trace_file: Option<PathBuf>,
     agent_kind: AgentKind,
     agent_shell: PathBuf,
     timeout_seconds: u64,
     auth_log: PathBuf,
     attach_token: Option<String>,
     attach_scope: AttachScope,
+    drive_token: Option<String>,
     initial_idle_ms: u64,
     tui_target: Option<TuiTarget>,
 }
@@ -584,15 +1002,20 @@ impl RunConfig {
         let mut socket = PathBuf::from("remux.sock");
         let mut state_file = PathBuf::from("remux-state.json");
         let mut scrollback_dir = PathBuf::from("remux-scrollback");
+        let mut attestation_dir = PathBuf::from("remux-attestations");
+        let mut attestation_mode = AttestationMode::HashChain;
         let mut metrics_file = PathBuf::from("remux-metrics.tsv");
         let mut ready_file = PathBuf::from("remux-ready.tsv");
         let mut fake_agent = sibling_binary("fake-agent")?;
+        let mut trace_agent = sibling_binary("trace-agent")?;
+        let mut trace_file = None;
         let mut agent_kind = AgentKind::Scripted;
         let mut agent_shell = PathBuf::from("/bin/sh");
         let mut timeout_seconds = 60;
         let mut auth_log = PathBuf::from("remux-attach.log");
         let mut attach_token = None;
         let mut attach_scope = AttachScope::Launch;
+        let mut drive_token = None;
         let mut initial_idle_ms = 0;
         let mut tui_target = None;
         let mut arguments = arguments;
@@ -613,15 +1036,20 @@ impl RunConfig {
                 "--socket" => socket = PathBuf::from(value),
                 "--state" => state_file = PathBuf::from(value),
                 "--scrollback-dir" => scrollback_dir = PathBuf::from(value),
+                "--attestation-dir" => attestation_dir = PathBuf::from(value),
+                "--attestation" => attestation_mode = AttestationMode::parse(&value)?,
                 "--metrics" => metrics_file = PathBuf::from(value),
                 "--ready" => ready_file = PathBuf::from(value),
                 "--fake-agent" => fake_agent = PathBuf::from(value),
+                "--trace-agent" => trace_agent = PathBuf::from(value),
+                "--trace" => trace_file = Some(PathBuf::from(value)),
                 "--agent-kind" => agent_kind = AgentKind::parse(&value)?,
                 "--agent-shell" => agent_shell = PathBuf::from(value),
                 "--timeout-seconds" => timeout_seconds = parse_positive(&value, "timeout-seconds")?,
                 "--auth-log" => auth_log = PathBuf::from(value),
                 "--attach-token" => attach_token = Some(value),
                 "--attach-scope" => attach_scope = AttachScope::parse(&value)?,
+                "--drive-token" => drive_token = Some(value),
                 "--initial-idle-ms" => {
                     initial_idle_ms = value.parse().map_err(|_| "invalid initial-idle-ms")?;
                 }
@@ -636,25 +1064,46 @@ impl RunConfig {
             socket,
             state_file,
             scrollback_dir,
+            attestation_dir,
+            attestation_mode,
             metrics_file,
             ready_file,
             fake_agent,
+            trace_agent,
+            trace_file,
             agent_kind,
             agent_shell,
             timeout_seconds,
             auth_log,
             attach_token,
             attach_scope,
+            drive_token,
             initial_idle_ms,
             tui_target,
         })
     }
 }
 
+#[derive(Clone, Copy)]
+enum AuthorizationScope {
+    Drive,
+    Lifecycle(AttachScope),
+}
+
+impl AuthorizationScope {
+    fn parse(value: &str) -> io::Result<Self> {
+        if value == "drive" {
+            Ok(Self::Drive)
+        } else {
+            AttachScope::parse(value).map(Self::Lifecycle)
+        }
+    }
+}
+
 struct AuthorizeConfig {
     auth_log: PathBuf,
     token: String,
-    scope: AttachScope,
+    scope: AuthorizationScope,
 }
 
 impl AuthorizeConfig {
@@ -670,7 +1119,7 @@ impl AuthorizeConfig {
             match flag.as_str() {
                 "--auth-log" => auth_log = Some(PathBuf::from(value)),
                 "--token" => token = Some(value),
-                "--scope" => scope = Some(AttachScope::parse(&value)?),
+                "--scope" => scope = Some(AuthorizationScope::parse(&value)?),
                 _ => return Err(format!("unknown flag {flag}").into()),
             }
         }
@@ -745,6 +1194,62 @@ impl TuiConfig {
     }
 }
 
+struct CaptureTraceConfig {
+    output: PathBuf,
+    command: String,
+    auth_log: PathBuf,
+    attach_token: String,
+}
+
+impl CaptureTraceConfig {
+    fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut output = None;
+        let mut command = None;
+        let mut auth_log = None;
+        let mut attach_token = None;
+        let mut arguments = arguments;
+        while let Some(flag) = arguments.next() {
+            let value = arguments.next().ok_or_else(|| usage().to_owned())?;
+            match flag.as_str() {
+                "--output" => output = Some(PathBuf::from(value)),
+                "--command"
+                    if !value.is_empty() && value.len() <= 4_096 && !value.contains('\n') =>
+                {
+                    command = Some(value);
+                }
+                "--auth-log" => auth_log = Some(PathBuf::from(value)),
+                "--attach-token" => attach_token = Some(value),
+                _ => return Err(usage().to_owned()),
+            }
+        }
+        Ok(Self {
+            output: output.ok_or_else(|| usage().to_owned())?,
+            command: command.ok_or_else(|| usage().to_owned())?,
+            auth_log: auth_log.ok_or_else(|| usage().to_owned())?,
+            attach_token: attach_token.ok_or_else(|| usage().to_owned())?,
+        })
+    }
+}
+
+struct VerifyAttestationConfig {
+    file: PathBuf,
+}
+
+impl VerifyAttestationConfig {
+    fn parse(mut arguments: impl Iterator<Item = String>) -> Result<Self, String> {
+        match (
+            arguments.next().as_deref(),
+            arguments.next(),
+            arguments.next(),
+        ) {
+            (Some("--file"), Some(file), None) => Ok(Self {
+                file: PathBuf::from(file),
+            }),
+            _ => Err(usage().to_owned()),
+        }
+    }
+}
+
 fn parse_positive<T>(value: &str, name: &str) -> Result<T, Box<dyn std::error::Error>>
 where
     T: std::str::FromStr + PartialEq + From<u8>,
@@ -764,5 +1269,5 @@ fn sibling_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn usage() -> &'static str {
-    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell] [--agent-shell PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]"
+    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell|trace-replay] [--agent-shell PATH] [--trace-agent PATH] [--trace PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--attestation-dir PATH] [--attestation off|hash-chain] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]\n       remux-supervisor verify-attestation --file PATH\n       remux-supervisor capture-trace --output PATH --command COMMAND --auth-log PATH --attach-token TOKEN"
 }
