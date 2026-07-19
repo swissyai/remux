@@ -1281,16 +1281,13 @@ fn parse_infinitty_pane_ids(list: &str) -> io::Result<BTreeSet<u64>> {
     let marker = "\"id\":";
     while let Some(index) = remaining.find(marker) {
         remaining = &remaining[index + marker.len()..];
-        let digits = remaining
-            .trim_start()
-            .bytes()
-            .take_while(u8::is_ascii_digit)
-            .collect::<Vec<_>>();
-        if digits.is_empty() {
+        let value = remaining.trim_start();
+        let digit_count = value.bytes().take_while(u8::is_ascii_digit).count();
+        let suffix = value[digit_count..].trim_start();
+        if digit_count == 0 || !(suffix.starts_with(',') || suffix.starts_with('}')) {
             return Err(io::Error::other("Infinitty list has invalid pane id"));
         }
-        let id = std::str::from_utf8(&digits)
-            .map_err(io::Error::other)?
+        let id = value[..digit_count]
             .parse::<u64>()
             .map_err(|_| io::Error::other("Infinitty pane id overflow"))?;
         if !ids.insert(id) {
@@ -1683,4 +1680,47 @@ fn unix_seconds() -> io::Result<u64> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use super::{parse_infinitty_pane_ids, parse_trace_metadata, REAL_TRACE_RELATIVE_PATH};
+
+    #[test]
+    fn infinitty_list_parser_accepts_only_distinct_numeric_pane_ids() {
+        let ids = parse_infinitty_pane_ids(r#"[{"id":1,"title":"one"}, {"title":"two","id": 20}]"#)
+            .expect("parse attributed Infinitty list shape");
+        assert_eq!(ids, BTreeSet::from([1, 20]));
+
+        for malformed in [
+            "[]",
+            r#"[{"id":}]"#,
+            r#"[{"id":1x}]"#,
+            r#"[{"id":1},{"id":1}]"#,
+            r#"[{"id":18446744073709551616}]"#,
+        ] {
+            assert!(
+                parse_infinitty_pane_ids(malformed).is_err(),
+                "accepted malformed Infinitty list: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_real_trace_metadata_matches_capture_receipt() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("bench crate has workspace parent");
+        let metadata = parse_trace_metadata(&workspace.join(REAL_TRACE_RELATIVE_PATH))
+            .expect("parse committed real trace metadata");
+
+        assert_eq!(metadata.records_per_session, 14);
+        assert_eq!(
+            metadata.command_sha256,
+            "36aa4f2db01ee05139a65c083995cc151390c1028817ccdd0566811486c7f2fd"
+        );
+    }
 }
