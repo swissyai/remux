@@ -2,8 +2,9 @@
 #![forbid(unsafe_code)]
 
 use bench::{
-    percentiles, render_json, render_markdown, BenchmarkConfig, BenchmarkReport, Machine,
-    Percentiles, ScenarioResult, TuiScenarioResult,
+    percentiles, render_json, render_markdown, BenchmarkConfig, BenchmarkReport,
+    InfinittyScenarioResult, Machine, Percentiles, ScenarioResult, TraceScenarioResult,
+    TuiScenarioResult,
 };
 
 #[test]
@@ -82,6 +83,47 @@ fn every_report_row_carries_its_reproduction_command() {
             command: "scripts/with_scorer_lock.sh cargo run -p bench".into(),
             interpretation: "Event-driven tracer tabs.".into(),
         }),
+        trace_results: vec![TraceScenarioResult {
+            model: "remux_real_trace_hash_chain".into(),
+            attestation_enabled: true,
+            trace_path: "bench/traces/w4-working-session.trace".into(),
+            trace_command_sha256:
+                "36aa4f2db01ee05139a65c083995cc151390c1028817ccdd0566811486c7f2fd".into(),
+            sessions: 20,
+            events: 280,
+            processes_spawned: 21,
+            per_event_forks: 0,
+            peak_rss_bytes: 30 * 1024 * 1024,
+            events_per_second: 50.0,
+            ingest_latency_us: Percentiles {
+                p50: 50,
+                p95: 100,
+                p99: 200,
+            },
+            redraw_latency_us: Percentiles {
+                p50: 100,
+                p95: 200,
+                p99: 300,
+            },
+            cpu_seconds: 0.2,
+            attestation_records: 380,
+            attestation_file_bytes: 60_000,
+            wall_seconds: 5.0,
+            command: "scripts/with_scorer_lock.sh cargo run -p bench".into(),
+            interpretation: "Replayed prior live trace.".into(),
+        }],
+        infinitty_result: InfinittyScenarioResult {
+            model: "infinitty_v0.1.7_macos".into(),
+            availability: "artifact-not-present".into(),
+            probe_paths: vec!["/Applications/Infinitty.app".into()],
+            sessions: 20,
+            events: None,
+            processes_spawned: None,
+            peak_rss_bytes: None,
+            latency_us: None,
+            command: None,
+            feature_gap: "No local artifact; no-network; metrics N/A.".into(),
+        },
     };
 
     let markdown = render_markdown(&report, "results/latest.json");
@@ -93,10 +135,15 @@ fn every_report_row_carries_its_reproduction_command() {
     assert!(markdown.contains("sampled cumulative process-tree CPU via ps"));
     assert!(markdown.contains("TUI-only RSS (MiB)"));
     assert!(markdown.contains("Event-driven tracer tabs."));
-    assert!(json.contains("\"schema_version\": 3"));
+    assert!(markdown.contains("W4 real-trace and attestation receipt"));
+    assert!(markdown.contains("artifact-not-present"));
+    assert!(json.contains("\"schema_version\": 4"));
     assert!(json.contains("\"per_event_forks\": 0"));
     assert!(json.contains("\"tui_peak_rss_bytes\": 8388608"));
     assert!(json.contains("\"idle_cpu_percent\": 0.016000"));
     assert!(json.contains("\"idle_frames_rendered\": 0"));
+    assert!(json.contains("\"attestation_records\": 380"));
+    assert!(json.contains("\"availability\": \"artifact-not-present\""));
+    assert!(json.contains("\"peak_rss_bytes\": null"));
     assert!(json.contains("\"reproduce\": \"scripts/with_scorer_lock.sh cargo run -p bench\""));
 }

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bench::system::{self, ResourceTracker};
 use bench::{
     bytes_to_mib, percentiles, render_json, render_markdown, BenchmarkConfig, BenchmarkReport,
-    Machine, ScenarioResult, TuiScenarioResult,
+    InfinittyScenarioResult, Machine, ScenarioResult, TraceScenarioResult, TuiScenarioResult,
 };
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
@@ -29,6 +29,8 @@ const TUI_IDLE_WINDOW: Duration = Duration::from_secs(60);
 const TUI_INITIAL_IDLE_MS: u64 = 65_000;
 const TUI_IDLE_CPU_LIMIT_PERCENT: f64 = 0.5;
 const TUI_REDRAW_P95_LIMIT_US: u64 = 50_000;
+const ATTESTATION_REDRAW_OVERHEAD_LIMIT_US: u64 = 5_000;
+const REAL_TRACE_RELATIVE_PATH: &str = "bench/traces/w4-working-session.trace";
 
 fn main() {
     if let Err(error) = run() {
@@ -73,8 +75,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config,
         &binary_directory.join("remux-supervisor"),
         &binary_directory.join("fake-agent"),
-        command,
+        command.clone(),
     )?;
+    let trace_path = workspace.join(REAL_TRACE_RELATIVE_PATH);
+    let trace_metadata = parse_trace_metadata(&trace_path)?;
+    let trace_before = run_trace_replay(
+        &config,
+        &binary_directory.join("remux-supervisor"),
+        &binary_directory.join("trace-agent"),
+        &trace_path,
+        &trace_metadata,
+        TraceAttestation::Off,
+        command.clone(),
+    )?;
+    let trace_after = run_trace_replay(
+        &config,
+        &binary_directory.join("remux-supervisor"),
+        &binary_directory.join("trace-agent"),
+        &trace_path,
+        &trace_metadata,
+        TraceAttestation::HashChain,
+        command.clone(),
+    )?;
+    let infinitty_result = run_infinitty_baseline(config.sessions, command)?;
     for result in [&scripted_result, &real_agent_result] {
         if result.peak_rss_bytes >= SUPERVISOR_RSS_LIMIT_BYTES {
             return Err(format!(
@@ -113,6 +136,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    for trace in [&trace_before, &trace_after] {
+        if trace.peak_rss_bytes >= SUPERVISOR_RSS_LIMIT_BYTES {
+            return Err(format!("{} exceeds 200MiB memory rail", trace.model).into());
+        }
+        if trace.per_event_forks != 0 {
+            return Err(format!("{} measured per-event forks", trace.model).into());
+        }
+        if trace.redraw_latency_us.p95 >= TUI_REDRAW_P95_LIMIT_US {
+            return Err(format!("{} redraw p95 exceeds 50ms", trace.model).into());
+        }
+    }
+    if trace_before.attestation_records != 0 || trace_before.attestation_file_bytes != 0 {
+        return Err("unattested real-trace baseline emitted attestation data".into());
+    }
+    if trace_after.attestation_records == 0 || trace_after.attestation_file_bytes == 0 {
+        return Err("attested real-trace replay emitted no attestation data".into());
+    }
+    let redraw_overhead = trace_after
+        .redraw_latency_us
+        .p95
+        .saturating_sub(trace_before.redraw_latency_us.p95);
+    if redraw_overhead > ATTESTATION_REDRAW_OVERHEAD_LIMIT_US {
+        return Err(format!(
+            "attestation redraw p95 overhead {redraw_overhead}us exceeds {ATTESTATION_REDRAW_OVERHEAD_LIMIT_US}us gate"
+        )
+        .into());
+    }
 
     let generated_unix_seconds = unix_seconds()?;
     let run_id = format!("run-{generated_unix_seconds}-{}", std::process::id());
@@ -123,6 +173,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         config: config.report_config(),
         results: vec![fork_result, scripted_result, real_agent_result],
         tui_result: Some(tui_result),
+        trace_results: vec![trace_before, trace_after],
+        infinitty_result,
     };
     let results_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("results");
     fs::create_dir_all(&results_directory)?;
@@ -158,6 +210,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             result.redraw_latency_us.p95
         );
     }
+    for result in &report.trace_results {
+        println!(
+            "{}: {} real-trace events, {:.2}MiB, {}us redraw p95, {} attestation records",
+            result.model,
+            result.events,
+            bytes_to_mib(result.peak_rss_bytes),
+            result.redraw_latency_us.p95,
+            result.attestation_records
+        );
+    }
+    println!(
+        "{}: {}",
+        report.infinitty_result.model, report.infinitty_result.availability
+    );
     Ok(())
 }
 
@@ -704,6 +770,552 @@ fn run_tui_baseline(
         let _ = child.wait();
     }
     result
+}
+
+#[derive(Clone, Copy)]
+enum TraceAttestation {
+    Off,
+    HashChain,
+}
+
+impl TraceAttestation {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::HashChain => "hash-chain",
+        }
+    }
+
+    fn model(self) -> &'static str {
+        match self {
+            Self::Off => "remux_real_trace_unattested",
+            Self::HashChain => "remux_real_trace_hash_chain",
+        }
+    }
+
+    fn enabled(self) -> bool {
+        matches!(self, Self::HashChain)
+    }
+}
+
+struct TraceMetadata {
+    records_per_session: u64,
+    command_sha256: String,
+}
+
+fn run_trace_replay(
+    config: &Config,
+    supervisor: &Path,
+    trace_agent: &Path,
+    trace_path: &Path,
+    trace: &TraceMetadata,
+    attestation: TraceAttestation,
+    command: String,
+) -> Result<TraceScenarioResult, Box<dyn std::error::Error>> {
+    let temporary = TemporaryDirectory::new()?;
+    let socket = temporary.path.join("s");
+    let state = temporary.path.join("state.json");
+    let scrollback = temporary.path.join("scrollback");
+    let attestations = temporary.path.join("attestations");
+    let metrics = temporary.path.join("metrics.tsv");
+    let ready = temporary.path.join("ready.tsv");
+    let auth_log = temporary.path.join("attach.log");
+    let tui_output = temporary.path.join("trace.ansi");
+    let suffix = attestation.argument();
+    let auth_token = format!("bench-trace-{suffix}-{}", std::process::id());
+    let drive_token = format!("bench-trace-drive-{suffix}-{}", std::process::id());
+    authorize(supervisor, &auth_log, &auth_token, "launch")?;
+    authorize(supervisor, &auth_log, &drive_token, "drive")?;
+    let timeout_seconds = 30_u64;
+    let mut child = Command::new(supervisor)
+        .args([
+            "run",
+            "--sessions",
+            &config.sessions.to_string(),
+            "--events-per-session",
+            &trace.records_per_session.to_string(),
+            "--rate",
+            &config.rate.to_string(),
+            "--agent-kind",
+            "trace-replay",
+            "--trace-agent",
+            path_text(trace_agent)?,
+            "--trace",
+            path_text(trace_path)?,
+            "--socket",
+            path_text(&socket)?,
+            "--state",
+            path_text(&state)?,
+            "--scrollback-dir",
+            path_text(&scrollback)?,
+            "--attestation-dir",
+            path_text(&attestations)?,
+            "--attestation",
+            attestation.argument(),
+            "--metrics",
+            path_text(&metrics)?,
+            "--ready",
+            path_text(&ready)?,
+            "--timeout-seconds",
+            &timeout_seconds.to_string(),
+            "--auth-log",
+            path_text(&auth_log)?,
+            "--attach-token",
+            &auth_token,
+            "--attach-scope",
+            "launch",
+            "--drive-token",
+            &drive_token,
+            "--tui-output",
+            path_text(&tui_output)?,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let root_pid = child.id();
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(Duration::from_secs(timeout_seconds.saturating_add(10)))
+        .ok_or("trace replay deadline overflow")?;
+    let mut resources = ResourceTracker::default();
+    let mut authorized_pids = None;
+    let status = loop {
+        let snapshot = system::snapshot()?;
+        let selected = system::descendants(&snapshot, root_pid);
+        resources.observe(&snapshot, &selected);
+        if ready.exists() && authorized_pids.is_none() {
+            authorized_pids = Some(parse_ready_pids(&ready, root_pid, config.sessions)?);
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{} timed out", attestation.model()).into());
+        }
+        thread::sleep(SAMPLE_INTERVAL);
+    };
+    let wall_seconds = started.elapsed().as_secs_f64();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+    if !status.success() {
+        return Err(format!(
+            "{} exited with {status}: {}",
+            attestation.model(),
+            stderr.trim()
+        )
+        .into());
+    }
+    let authorized_pids = authorized_pids.ok_or("trace replay produced no ready PID receipt")?;
+    let missed = authorized_pids
+        .difference(resources.observed_pids())
+        .copied()
+        .collect::<Vec<_>>();
+    if !missed.is_empty() {
+        return Err(format!("trace sampler missed authorized PIDs {missed:?}").into());
+    }
+    let per_event_forks = u64::try_from(
+        resources
+            .observed_pids()
+            .difference(&authorized_pids)
+            .count(),
+    )?;
+    let parsed = parse_metrics(&metrics)?;
+    let total_events = u64::from(config.sessions)
+        .checked_mul(trace.records_per_session)
+        .ok_or("real-trace event count overflow")?;
+    expect_metric(&parsed, "schema", 3)?;
+    expect_metric(&parsed, "events_ingested", total_events)?;
+    expect_metric(&parsed, "children_spawned", u64::from(config.sessions))?;
+    expect_metric(
+        &parsed,
+        "attestation_enabled",
+        u64::from(attestation.enabled()),
+    )?;
+    if parsed.get("agent_kind").map(String::as_str) != Some("trace-replay") {
+        return Err("real-trace receipt has wrong agent kind".into());
+    }
+    let ingest_samples = parse_metric_samples(&parsed, "latencies_us")?;
+    let redraw_samples = parse_metric_samples(&parsed, "redraw_latencies_us")?;
+    if ingest_samples.len() != usize::try_from(total_events)?
+        || redraw_samples.len() != usize::try_from(total_events)?
+    {
+        return Err("real-trace latency count differs from event count".into());
+    }
+    let attestation_records = metric(&parsed, "attestation_records")?;
+    let attestation_file_bytes = metric(&parsed, "attestation_file_bytes")?;
+    if attestation.enabled() {
+        verify_attestation_files(supervisor, &attestations, config.sessions)?;
+        let heads = parsed
+            .get("attestation_heads")
+            .ok_or("attested replay misses chain heads")?;
+        if heads.split(',').count() != usize::try_from(config.sessions)? {
+            return Err("attested replay chain-head count differs from sessions".into());
+        }
+    }
+    let output = fs::read_to_string(&tui_output)?;
+    if !output.contains("AGENT DRIVING") {
+        return Err("real-trace TUI misses explicit drive indicator".into());
+    }
+    verify_passive_restore(supervisor, &state)?;
+    let processes_spawned = resources.distinct_pid_count();
+    let peak_rss_bytes = resources.peak_rss_bytes();
+    Ok(TraceScenarioResult {
+        model: attestation.model().to_owned(),
+        attestation_enabled: attestation.enabled(),
+        trace_path: REAL_TRACE_RELATIVE_PATH.to_owned(),
+        trace_command_sha256: trace.command_sha256.clone(),
+        sessions: config.sessions,
+        events: total_events,
+        processes_spawned,
+        per_event_forks,
+        peak_rss_bytes,
+        events_per_second: total_events as f64 / wall_seconds,
+        ingest_latency_us: percentiles(&ingest_samples)?,
+        redraw_latency_us: percentiles(&redraw_samples)?,
+        cpu_seconds: resources.cpu_seconds(),
+        attestation_records,
+        attestation_file_bytes,
+        wall_seconds,
+        command,
+        interpretation: format!(
+            "Replayed {} records/session from a prior live project-working PTY capture across {} sessions; {} measured PIDs, {} event forks; attestation {}.",
+            trace.records_per_session,
+            config.sessions,
+            processes_spawned,
+            per_event_forks,
+            attestation.argument()
+        ),
+    })
+}
+
+fn verify_attestation_files(
+    supervisor: &Path,
+    directory: &Path,
+    sessions: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for index in 0..sessions {
+        let path = directory.join(format!("session-{index:03}.attest"));
+        let output = Command::new(supervisor)
+            .args(["verify-attestation", "--file", path_text(&path)?])
+            .stdin(Stdio::null())
+            .output()?;
+        if !output.status.success() || !output.stdout.starts_with(b"integrity\tcomplete\n") {
+            return Err(format!(
+                "external attestation verification failed for session-{index:03}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn parse_trace_metadata(path: &Path) -> io::Result<TraceMetadata> {
+    let input = fs::read_to_string(path)?;
+    if !input.ends_with('\n') || input.lines().next() != Some("REMUX_TRACE_V1") {
+        return Err(io::Error::other("real trace has invalid framing"));
+    }
+    let fields = parse_metrics_lines(input.lines().skip(1).take(5))?;
+    if fields.get("source").map(String::as_str) != Some("live-working-session") {
+        return Err(io::Error::other(
+            "real trace source is not live-working-session",
+        ));
+    }
+    if fields.get("exit_code").map(String::as_str) != Some("0") {
+        return Err(io::Error::other("real trace capture did not exit zero"));
+    }
+    let command_sha256 = fields
+        .get("command_sha256")
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        .ok_or_else(|| io::Error::other("real trace command digest is invalid"))?
+        .clone();
+    let records_per_session = metric(&fields, "record_count")?;
+    if records_per_session == 0 {
+        return Err(io::Error::other("real trace is empty"));
+    }
+    let actual_records = u64::try_from(input.lines().skip(6).count()).map_err(io::Error::other)?;
+    if actual_records != records_per_session {
+        return Err(io::Error::other("real trace record count differs"));
+    }
+    Ok(TraceMetadata {
+        records_per_session,
+        command_sha256,
+    })
+}
+
+fn run_infinitty_baseline(
+    sessions: u32,
+    command: String,
+) -> Result<InfinittyScenarioResult, Box<dyn std::error::Error>> {
+    let mut candidates = vec![
+        PathBuf::from("/Applications/Infinitty.app/Contents/MacOS/Infinitty"),
+        PathBuf::from("/Applications/Infinitty.app/Contents/MacOS/infinitty"),
+    ];
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join("Applications/Infinitty.app/Contents/MacOS/Infinitty"));
+        candidates.push(home.join("Applications/Infinitty.app/Contents/MacOS/infinitty"));
+    }
+    if let Some(explicit) = env::var_os("INFINITTY_APP") {
+        candidates.push(PathBuf::from(explicit));
+    }
+    let probe_paths = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let Some(binary) = candidates.iter().find(|path| path.is_file()) else {
+        return Ok(InfinittyScenarioResult {
+            model: "infinitty_v0.1.7_macos".to_owned(),
+            availability: "artifact-not-present".to_owned(),
+            probe_paths,
+            sessions,
+            events: None,
+            processes_spawned: None,
+            peak_rss_bytes: None,
+            latency_us: None,
+            command: None,
+            feature_gap: "Same-machine probes found no local Infinitty checkout, app bundle, or executable; the no-network rail forbids fetching one, so RSS/process/latency are measured-unavailable N/A rather than inferred.".to_owned(),
+        });
+    };
+    if sessions < 2 {
+        return Err("Infinitty fleet baseline requires at least two sessions".into());
+    }
+    let app_socket = Path::new("/tmp/infinitty-current.sock");
+    if matches!(infinitty_request(app_socket, "ping"), Ok(response) if response == "pong") {
+        return Err("refusing to benchmark over an existing Infinitty instance".into());
+    }
+    if fs::symlink_metadata(app_socket).is_ok() {
+        fs::remove_file(app_socket)?;
+    }
+    let temporary = TemporaryDirectory::new()?;
+    let config_path = temporary.path.join("infinitty.conf");
+    fs::write(
+        &config_path,
+        "auto-update = off\nhints = false\nnotch = false\nmarkdown-render = off\n",
+    )?;
+    let mut child = Command::new(binary)
+        .env("INFINITTY_CONFIG", &config_path)
+        .env("INFINITTY_NO_ACTIVATE", "1")
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let root_pid = child.id();
+    let result = (|| -> Result<InfinittyScenarioResult, Box<dyn std::error::Error>> {
+        let startup_deadline = Instant::now()
+            .checked_add(Duration::from_secs(15))
+            .ok_or("Infinitty startup deadline overflow")?;
+        let mut resources = ResourceTracker::default();
+        loop {
+            let snapshot = system::snapshot()?;
+            resources.observe(&snapshot, &system::descendants(&snapshot, root_pid));
+            if matches!(infinitty_request(app_socket, "ping"), Ok(response) if response == "pong") {
+                break;
+            }
+            if let Some(status) = child.try_wait()? {
+                return Err(format!("Infinitty exited during startup with {status}").into());
+            }
+            if Instant::now() >= startup_deadline {
+                return Err("Infinitty app socket did not become ready".into());
+            }
+            thread::sleep(SAMPLE_INTERVAL);
+        }
+        let initial_list = infinitty_request(app_socket, "list")?;
+        let mut pane_ids = parse_infinitty_pane_ids(&initial_list)?;
+        if pane_ids.len() != 1 {
+            return Err("Infinitty did not start with exactly one pane".into());
+        }
+        let mut latencies = Vec::with_capacity(usize::try_from(sessions - 1)?);
+        for _ in 1..sessions {
+            let started = Instant::now();
+            let response = infinitty_request(app_socket, "new-tab /tmp")?;
+            latencies.push(u64::try_from(started.elapsed().as_micros())?);
+            let pane_id = response
+                .parse::<u64>()
+                .map_err(|_| format!("invalid Infinitty new-tab response: {response}"))?;
+            if !pane_ids.insert(pane_id) {
+                return Err("Infinitty returned a duplicate pane id".into());
+            }
+            let snapshot = system::snapshot()?;
+            resources.observe(&snapshot, &system::descendants(&snapshot, root_pid));
+        }
+        let listed = parse_infinitty_pane_ids(&infinitty_request(app_socket, "list")?)?;
+        if listed != pane_ids || listed.len() != usize::try_from(sessions)? {
+            return Err("Infinitty list does not show the requested 20-pane shape".into());
+        }
+        let steady_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .ok_or("Infinitty steady deadline overflow")?;
+        loop {
+            let snapshot = system::snapshot()?;
+            let descendants = system::descendants(&snapshot, root_pid);
+            resources.observe(&snapshot, &descendants);
+            if descendants.len() != usize::try_from(sessions)?.saturating_add(1) {
+                return Err(format!(
+                    "Infinitty process tree has {} processes for {sessions} panes",
+                    descendants.len()
+                )
+                .into());
+            }
+            if let Some(status) = child.try_wait()? {
+                return Err(
+                    format!("Infinitty exited during steady sampling with {status}").into(),
+                );
+            }
+            if Instant::now() >= steady_deadline {
+                break;
+            }
+            thread::sleep(SAMPLE_INTERVAL);
+        }
+        let process_count = resources.distinct_pid_count();
+        let resident_shape = u64::from(sessions).saturating_add(1);
+        if process_count < resident_shape {
+            return Err(format!(
+                "Infinitty sampler observed only {process_count}/{resident_shape} resident processes"
+            )
+            .into());
+        }
+        let peak_rss_bytes = resources.peak_rss_bytes();
+        let latency_us = percentiles(&latencies)?;
+        for pane_id in &pane_ids {
+            let response = infinitty_request(app_socket, &format!("close {pane_id}"))?;
+            if response != "ok" {
+                return Err(format!("Infinitty close failed: {response}").into());
+            }
+        }
+        Ok(InfinittyScenarioResult {
+            model: "infinitty_v0.1.7_macos".to_owned(),
+            availability: "measured".to_owned(),
+            probe_paths,
+            sessions,
+            events: Some(u64::from(sessions - 1)),
+            processes_spawned: Some(process_count),
+            peak_rss_bytes: Some(peak_rss_bytes),
+            latency_us: Some(latency_us),
+            command: Some(format!("INFINITTY_APP={} {command}", binary.display())),
+            feature_gap: "Measured latency is app-socket new-tab request→pane-id for 19 additions to one initial pane. The distinct-PID union may include transient shell-startup helpers; steady snapshots enforce one app + 20 resident shells. Infinitty exposes no event→flushed-redraw receipt and has no persistence/restore or attestation, so those cells remain N/A.".to_owned(),
+        })
+    })();
+
+    if result.is_err() {
+        if let Ok(list) = infinitty_request(app_socket, "list") {
+            if let Ok(ids) = parse_infinitty_pane_ids(&list) {
+                for pane_id in ids {
+                    let _ = infinitty_request(app_socket, &format!("close {pane_id}"));
+                }
+            }
+        }
+    }
+    let shutdown_deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or("Infinitty shutdown deadline overflow")?;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= shutdown_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(SAMPLE_INTERVAL);
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+    let expected_socket = PathBuf::from(format!("/tmp/infinitty-app-{root_pid}.sock"));
+    if matches!(fs::read_link(app_socket), Ok(target) if target == expected_socket) {
+        let _ = fs::remove_file(app_socket);
+    }
+    let _ = fs::remove_file(&expected_socket);
+    if let Some(status) = status {
+        if !status.success() {
+            return Err(format!("Infinitty exited with {status}: {}", stderr.trim()).into());
+        }
+    }
+    result
+}
+
+fn infinitty_request(path: &Path, request: &str) -> io::Result<String> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4_096];
+    while response.len() <= 256 * 1_024 {
+        let bytes = stream.read(&mut buffer)?;
+        if bytes == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..bytes]);
+        if response.contains(&b'\n') {
+            break;
+        }
+    }
+    let line = response
+        .split(|byte| *byte == b'\n')
+        .next()
+        .ok_or_else(|| io::Error::other("Infinitty returned no response"))?;
+    String::from_utf8(line.to_vec())
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| io::Error::other("Infinitty response is not UTF-8"))
+}
+
+fn parse_infinitty_pane_ids(list: &str) -> io::Result<BTreeSet<u64>> {
+    let mut ids = BTreeSet::new();
+    let mut remaining = list;
+    let marker = "\"id\":";
+    while let Some(index) = remaining.find(marker) {
+        remaining = &remaining[index + marker.len()..];
+        let digits = remaining
+            .trim_start()
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .collect::<Vec<_>>();
+        if digits.is_empty() {
+            return Err(io::Error::other("Infinitty list has invalid pane id"));
+        }
+        let id = std::str::from_utf8(&digits)
+            .map_err(io::Error::other)?
+            .parse::<u64>()
+            .map_err(|_| io::Error::other("Infinitty pane id overflow"))?;
+        if !ids.insert(id) {
+            return Err(io::Error::other("Infinitty list has duplicate pane id"));
+        }
+    }
+    if ids.is_empty() {
+        return Err(io::Error::other("Infinitty list has no pane ids"));
+    }
+    Ok(ids)
+}
+
+fn parse_metrics_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> io::Result<BTreeMap<String, String>> {
+    let mut metrics = BTreeMap::new();
+    for line in lines {
+        let (key, value) = line
+            .split_once('\t')
+            .ok_or_else(|| io::Error::other("invalid key/value line"))?;
+        if metrics.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err(io::Error::other("duplicate key/value field"));
+        }
+    }
+    Ok(metrics)
 }
 
 fn observe_tui_resources(

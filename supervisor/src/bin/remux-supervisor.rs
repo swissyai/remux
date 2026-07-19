@@ -78,6 +78,18 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     let session_ids = (0..config.sessions)
         .map(|index| format!("session-{index:03}"))
         .collect::<Vec<_>>();
+    if config.agent_kind == AgentKind::TraceReplay {
+        let trace_path = config
+            .trace_file
+            .as_deref()
+            .ok_or("trace-replay requires --trace")?;
+        let trace = RecordedTrace::read(trace_path)?;
+        if trace.records().len() != usize::try_from(config.events_per_session)? {
+            return Err("events-per-session differs from recorded trace count".into());
+        }
+    } else if config.trace_file.is_some() {
+        return Err("--trace requires --agent-kind trace-replay".into());
+    }
     let lifecycle = consume_lifecycle_authorization(
         &config.auth_log,
         config.attach_scope,
@@ -195,6 +207,29 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                     start_delay_us,
                 ));
                 pty_readers.push(spawn_real_agent_events(
+                    master,
+                    event_socket,
+                    session_id.clone(),
+                    attestation_observer.clone(),
+                ));
+                children.push(child);
+            }
+            AgentKind::TraceReplay => {
+                let trace = config
+                    .trace_file
+                    .as_deref()
+                    .ok_or("trace-replay requires --trace")?;
+                let mut command = Command::new(&config.trace_agent);
+                command.args([
+                    "--trace",
+                    path_text(trace)?,
+                    "--start-delay-us",
+                    &start_delay_us.to_string(),
+                ]);
+                let (child, master) = spawn_authorized_pty(&lifecycle, session_id, &mut command)?;
+                record_attested_spawn(&attestation_observer, session_id, child.id())?;
+                let event_socket = UnixStream::connect(&config.socket)?;
+                pty_readers.push(spawn_trace_events(
                     master,
                     event_socket,
                     session_id.clone(),
@@ -659,6 +694,62 @@ fn spawn_real_agent_events(
     })
 }
 
+fn spawn_trace_events(
+    master: File,
+    mut socket: UnixStream,
+    session_id: String,
+    attestation: Option<AttestationObserver>,
+) -> JoinHandle<io::Result<u64>> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(master);
+        let mut total = 0_u64;
+        let mut sequence = 0_u64;
+        loop {
+            let mut line = String::new();
+            let bytes = match reader.read_line(&mut line) {
+                Ok(bytes) => bytes,
+                Err(error) if error.raw_os_error() == Some(5) => return Ok(total),
+                Err(error) => return Err(error),
+            };
+            if bytes == 0 {
+                return Ok(total);
+            }
+            let observed_at = unix_micros_now().map_err(io::Error::other)?;
+            if let Some(observer) = &attestation {
+                observer.output(&session_id, line.as_bytes())?;
+            }
+            total = total
+                .checked_add(u64::try_from(bytes).map_err(io::Error::other)?)
+                .ok_or_else(|| io::Error::other("PTY byte count overflow"))?;
+            let payload = line
+                .trim_end_matches(['\r', '\n'])
+                .chars()
+                .map(|character| {
+                    if matches!(character, '\t' | '\r' | '\n') {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>();
+            if payload.is_empty() {
+                continue;
+            }
+            let event = Event {
+                session_id: session_id.clone(),
+                sequence,
+                sent_unix_micros: observed_at,
+                kind: EventKind::Output,
+                payload,
+            };
+            socket.write_all(event.encode().map_err(io::Error::other)?.as_bytes())?;
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("trace event sequence overflow"))?;
+        }
+    })
+}
+
 fn sleep_until(deadline: Instant) {
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         thread::sleep(remaining.min(Duration::from_millis(100)));
@@ -800,6 +891,7 @@ impl AttestationMode {
 enum AgentKind {
     Scripted,
     RealShell,
+    TraceReplay,
 }
 
 impl AgentKind {
@@ -807,7 +899,8 @@ impl AgentKind {
         match value {
             "scripted" => Ok(Self::Scripted),
             "real-shell" => Ok(Self::RealShell),
-            _ => Err("agent-kind must be scripted or real-shell".to_owned()),
+            "trace-replay" => Ok(Self::TraceReplay),
+            _ => Err("agent-kind must be scripted, real-shell, or trace-replay".to_owned()),
         }
     }
 
@@ -815,6 +908,7 @@ impl AgentKind {
         match self {
             Self::Scripted => "scripted",
             Self::RealShell => "real-shell",
+            Self::TraceReplay => "trace-replay",
         }
     }
 }
@@ -845,6 +939,8 @@ struct RunConfig {
     metrics_file: PathBuf,
     ready_file: PathBuf,
     fake_agent: PathBuf,
+    trace_agent: PathBuf,
+    trace_file: Option<PathBuf>,
     agent_kind: AgentKind,
     agent_shell: PathBuf,
     timeout_seconds: u64,
@@ -869,6 +965,8 @@ impl RunConfig {
         let mut metrics_file = PathBuf::from("remux-metrics.tsv");
         let mut ready_file = PathBuf::from("remux-ready.tsv");
         let mut fake_agent = sibling_binary("fake-agent")?;
+        let mut trace_agent = sibling_binary("trace-agent")?;
+        let mut trace_file = None;
         let mut agent_kind = AgentKind::Scripted;
         let mut agent_shell = PathBuf::from("/bin/sh");
         let mut timeout_seconds = 60;
@@ -901,6 +999,8 @@ impl RunConfig {
                 "--metrics" => metrics_file = PathBuf::from(value),
                 "--ready" => ready_file = PathBuf::from(value),
                 "--fake-agent" => fake_agent = PathBuf::from(value),
+                "--trace-agent" => trace_agent = PathBuf::from(value),
+                "--trace" => trace_file = Some(PathBuf::from(value)),
                 "--agent-kind" => agent_kind = AgentKind::parse(&value)?,
                 "--agent-shell" => agent_shell = PathBuf::from(value),
                 "--timeout-seconds" => timeout_seconds = parse_positive(&value, "timeout-seconds")?,
@@ -927,6 +1027,8 @@ impl RunConfig {
             metrics_file,
             ready_file,
             fake_agent,
+            trace_agent,
+            trace_file,
             agent_kind,
             agent_shell,
             timeout_seconds,
@@ -1125,5 +1227,5 @@ fn sibling_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn usage() -> &'static str {
-    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell] [--agent-shell PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--attestation-dir PATH] [--attestation off|hash-chain] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]\n       remux-supervisor verify-attestation --file PATH\n       remux-supervisor capture-trace --output PATH --command COMMAND --auth-log PATH --attach-token TOKEN"
+    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell|trace-replay] [--agent-shell PATH] [--trace-agent PATH] [--trace PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--attestation-dir PATH] [--attestation off|hash-chain] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]\n       remux-supervisor verify-attestation --file PATH\n       remux-supervisor capture-trace --output PATH --command COMMAND --auth-log PATH --attach-token TOKEN"
 }
