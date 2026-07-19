@@ -27,6 +27,22 @@ pub enum ConnectionState {
     Live,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriveIndicator {
+    Absent,
+    Held,
+}
+
+impl DriveIndicator {
+    fn from_presence(presence: &DrivePresence, session_id: &str) -> Self {
+        if presence.is_driven(session_id) {
+            Self::Held
+        } else {
+            Self::Absent
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Tab {
     session_id: String,
@@ -34,7 +50,7 @@ struct Tab {
     status: String,
     tail: VecDeque<String>,
     connection: ConnectionState,
-    agent_driving: bool,
+    drive: DriveIndicator,
 }
 
 /// Bounded presentation state for one tracer tab strip.
@@ -123,7 +139,7 @@ impl TracerTabView {
                 status: display_text(status.as_ref(), MAX_STATUS_CHARS),
                 tail,
                 connection,
-                agent_driving: drive.is_driven(session_id),
+                drive: DriveIndicator::from_presence(drive, session_id),
             });
         }
         if tabs.is_empty() {
@@ -156,7 +172,7 @@ impl TracerTabView {
                 .get_mut(index)
                 .ok_or_else(|| invalid_data("TUI tab index is invalid"))?;
             tab.connection = ConnectionState::Live;
-            tab.agent_driving = drive.is_driven(&event.session_id);
+            tab.drive = DriveIndicator::from_presence(drive, &event.session_id);
             match event.kind {
                 EventKind::Status => {
                     tab.status = display_text(&event.payload, MAX_STATUS_CHARS);
@@ -282,10 +298,10 @@ impl<W: Write> TracerRenderer<W> {
 }
 
 fn indicator(tab: &Tab) -> &'static str {
-    match (tab.connection, tab.agent_driving) {
+    match (tab.connection, tab.drive) {
         (ConnectionState::Detached, _) => "DETACHED",
-        (ConnectionState::Live, true) => "AGENT DRIVING",
-        (ConnectionState::Live, false) => "LIVE",
+        (ConnectionState::Live, DriveIndicator::Held) => "AGENT DRIVING",
+        (ConnectionState::Live, DriveIndicator::Absent) => "LIVE",
     }
 }
 

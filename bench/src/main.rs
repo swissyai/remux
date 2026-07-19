@@ -311,6 +311,7 @@ fn run_supervisor_baseline(
     let socket = temporary.path.join("s");
     let state = temporary.path.join("state.json");
     let scrollback = temporary.path.join("scrollback");
+    let attestations = temporary.path.join("attestations");
     let metrics = temporary.path.join("metrics.tsv");
     let ready = temporary.path.join("ready.tsv");
     let auth_log = temporary.path.join("attach.log");
@@ -335,6 +336,8 @@ fn run_supervisor_baseline(
             path_text(&state)?,
             "--scrollback-dir",
             path_text(&scrollback)?,
+            "--attestation-dir",
+            path_text(&attestations)?,
             "--metrics",
             path_text(&metrics)?,
             "--ready",
@@ -412,7 +415,7 @@ fn run_supervisor_baseline(
 
     let parsed = parse_metrics(&metrics)?;
     let total_events = config.total_events()?;
-    expect_metric(&parsed, "schema", 2)?;
+    expect_metric(&parsed, "schema", 3)?;
     expect_metric(&parsed, "events_ingested", total_events)?;
     expect_metric(&parsed, "children_spawned", u64::from(config.sessions))?;
     if parsed.get("agent_kind").map(String::as_str) != Some(agent.argument()) {
@@ -464,6 +467,7 @@ fn run_tui_baseline(
     let socket = temporary.path.join("s");
     let state = temporary.path.join("state.json");
     let scrollback = temporary.path.join("scrollback");
+    let attestations = temporary.path.join("attestations");
     let metrics = temporary.path.join("metrics.tsv");
     let ready = temporary.path.join("ready.tsv");
     let auth_log = temporary.path.join("attach.log");
@@ -493,6 +497,8 @@ fn run_tui_baseline(
             path_text(&state)?,
             "--scrollback-dir",
             path_text(&scrollback)?,
+            "--attestation-dir",
+            path_text(&attestations)?,
             "--metrics",
             path_text(&metrics)?,
             "--ready",
@@ -640,7 +646,7 @@ fn run_tui_baseline(
         )?;
         let parsed = parse_metrics(&metrics)?;
         let total_events = config.total_events()?;
-        expect_metric(&parsed, "schema", 2)?;
+        expect_metric(&parsed, "schema", 3)?;
         expect_metric(&parsed, "events_ingested", total_events)?;
         expect_metric(&parsed, "children_spawned", u64::from(config.sessions))?;
         if parsed.get("agent_kind").map(String::as_str) != Some("real-shell") {
