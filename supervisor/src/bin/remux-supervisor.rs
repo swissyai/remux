@@ -140,8 +140,8 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
         if trace.records().len() != usize::try_from(config.events_per_session)? {
             return Err("events-per-session differs from recorded trace count".into());
         }
-    } else if config.trace_file.is_some() {
-        return Err("--trace requires --agent-kind trace-replay".into());
+    } else if config.trace_file.is_some() || config.trace_hold_after_ms != 0 {
+        return Err("--trace and --trace-hold-after-ms require --agent-kind trace-replay".into());
     }
     let lifecycle = consume_lifecycle_authorization(
         &config.auth_log,
@@ -288,6 +288,8 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                     path_text(trace)?,
                     "--start-delay-us",
                     &start_delay_us.to_string(),
+                    "--hold-after-trace-ms",
+                    &config.trace_hold_after_ms.to_string(),
                 ]);
                 let mut command = protect_attestation_command(
                     &command,
@@ -1099,6 +1101,7 @@ struct RunConfig {
     fake_agent: PathBuf,
     trace_agent: PathBuf,
     trace_file: Option<PathBuf>,
+    trace_hold_after_ms: u64,
     agent_kind: AgentKind,
     agent_shell: PathBuf,
     timeout_seconds: u64,
@@ -1125,6 +1128,7 @@ impl RunConfig {
         let mut fake_agent = sibling_binary("fake-agent")?;
         let mut trace_agent = sibling_binary("trace-agent")?;
         let mut trace_file = None;
+        let mut trace_hold_after_ms = 0;
         let mut agent_kind = AgentKind::Scripted;
         let mut agent_shell = PathBuf::from("/bin/sh");
         let mut timeout_seconds = 60;
@@ -1159,6 +1163,9 @@ impl RunConfig {
                 "--fake-agent" => fake_agent = PathBuf::from(value),
                 "--trace-agent" => trace_agent = PathBuf::from(value),
                 "--trace" => trace_file = Some(PathBuf::from(value)),
+                "--trace-hold-after-ms" => {
+                    trace_hold_after_ms = value.parse().map_err(|_| "invalid trace hold")?;
+                }
                 "--agent-kind" => agent_kind = AgentKind::parse(&value)?,
                 "--agent-shell" => agent_shell = PathBuf::from(value),
                 "--timeout-seconds" => timeout_seconds = parse_positive(&value, "timeout-seconds")?,
@@ -1187,6 +1194,7 @@ impl RunConfig {
             fake_agent,
             trace_agent,
             trace_file,
+            trace_hold_after_ms,
             agent_kind,
             agent_shell,
             timeout_seconds,
@@ -1389,5 +1397,5 @@ fn public_run_usage() -> &'static str {
 }
 
 fn usage() -> &'static str {
-    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       REMUX_AUTH_LOG=PATH REMUX_ATTACH_TOKEN=TOKEN [REMUX_ATTESTATION_DIR=DIR] remux-supervisor run --cwd DIR --attest -- COMMAND...\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell|trace-replay] [--agent-shell PATH] [--trace-agent PATH] [--trace PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--attestation-dir PATH] [--attestation off|hash-chain] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]\n       remux-supervisor verify-attestation --file PATH\n       remux-supervisor capture-trace --output PATH --command COMMAND --auth-log PATH --attach-token TOKEN"
+    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       REMUX_AUTH_LOG=PATH REMUX_ATTACH_TOKEN=TOKEN [REMUX_ATTESTATION_DIR=DIR] remux-supervisor run --cwd DIR --attest -- COMMAND...\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell|trace-replay] [--agent-shell PATH] [--trace-agent PATH] [--trace PATH] [--trace-hold-after-ms N] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--attestation-dir PATH] [--attestation off|hash-chain] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]\n       remux-supervisor verify-attestation --file PATH\n       remux-supervisor capture-trace --output PATH --command COMMAND --auth-log PATH --attach-token TOKEN"
 }

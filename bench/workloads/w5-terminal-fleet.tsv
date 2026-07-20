@@ -1,0 +1,12 @@
+REMUX_GLASS_WORKLOAD_V1
+sessions	20
+trace	bench/traces/w4-working-session.trace
+trace_records_per_session	14
+trace_last_event_us	3736680
+hold_after_trace_ms	10000
+steady_window_ms	1000
+sample_interval_ms	20
+arm_timeout_seconds	45
+max_load_per_logical_cpu_milli	1000
+min_free_memory_percent	25
+cmux_hook_events	5
