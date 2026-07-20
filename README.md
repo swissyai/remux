@@ -33,11 +33,17 @@ architecture) live in DOCTRINE.md — read it before designing any wave.
 
 ## Status
 
-W4 attested substrate: one resident Rust supervisor owns authorized PTYs, passive
-crash-safe state/scrollback, event-driven tracer tabs, exact observe/drive/lifecycle
-capabilities, and per-session supervisor-observed SHA-256 attestation chains. The
-20-session benchmark publishes RSS/process/latency, idle/render rails, real-trace
-attestation overhead, and an Infinitty baseline in `bench/RESULTS.md`.
+W5 glass receipts: `remux-supervisor run --cwd DIR --attest -- COMMAND...` is the
+public arbitrary-command route behind a prior single-use lifecycle grant; it preserves
+command stdout and emits an externally verified chain receipt on stderr. The frozen
+20-session terminal-layer sweep and founder-owned glass recommendation live in
+`bench/GLASS_RESULTS.md`: remux and fresh Infinitty are numeric; correction 01 keeps
+resident cmux/Ghostty state off-limits, so failed isolated-instance arms are honest
+N/A. Current cmux hook cost is refreshed separately from five live hook CLI processes.
+
+The inherited W4 table remains in `bench/RESULTS.md`: RSS/process/latency,
+idle/render rails, real-trace attestation overhead, and the attributed Infinitty
+baseline.
 
 Run all build/test/benchmark commands through `scripts/with_scorer_lock.sh`; Cargo is
 forced offline. See `CONTEXT.md` for stable domain terms and `AGENTS.md` for the

@@ -5,6 +5,7 @@
 //! Contract: scenario runners return measurements in common units; renderers produce
 //! deterministic Markdown and JSON without knowing supervisor implementation details.
 
+pub mod glass;
 pub mod system;
 
 #[derive(Clone, Debug, PartialEq)]

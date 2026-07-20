@@ -1,0 +1,13 @@
+schema	1
+workload_sha256	ef7890d4cd5e04360a1a952d3aefb7c0378f1c1f929ce0e2484c25eb727f66c5
+manifest_reference	pass
+manifest_truncation_negative	rejected-by-test
+idle_current	pass
+idle_load_negative	rejected
+idle_memory_negative	rejected
+session_shape_reference	pass
+session_shape_negative	rejected
+empty_metric_negative	rejected
+load_one	2.81
+logical_cpus	10
+free_memory_percent	48

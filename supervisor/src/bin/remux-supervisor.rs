@@ -29,6 +29,9 @@ use supervisor::protocol::{parse_message, unix_micros_now, Control, Event, Event
 use supervisor::restore::inspect_passive;
 use supervisor::scrollback::ScrollbackWriter;
 use supervisor::state::{dump_atomic, restore_passive, LiveState};
+use supervisor::supervised_run::{
+    run_attested_command, SupervisedRunConfig, ATTACH_TOKEN_ENV, ATTESTATION_DIR_ENV, AUTH_LOG_ENV,
+};
 use supervisor::trace::{RecordedTrace, TraceRecord};
 use supervisor::tui::{TracerRenderer, TracerTabView};
 
@@ -38,26 +41,76 @@ const REAL_EVENT_PREFIX: &str = "remux-event:";
 const REAL_AGENT_SCRIPT: &str = "while IFS= read -r line; do [ \"$line\" = \"__remux_done__\" ] && break; printf 'remux-event:%s\\n' \"$line\"; done";
 
 fn main() {
-    if let Err(error) = entrypoint() {
-        eprintln!("remux-supervisor: {error}");
-        std::process::exit(1);
+    match entrypoint() {
+        Ok(EntryOutcome::Success) => {}
+        Ok(EntryOutcome::Child(status)) => std::process::exit(status),
+        Err(error) => {
+            eprintln!("remux-supervisor: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn entrypoint() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntryOutcome {
+    Success,
+    Child(i32),
+}
+
+fn entrypoint() -> Result<EntryOutcome, Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
     match arguments.next().as_deref() {
-        Some("authorize") => authorize(AuthorizeConfig::parse(arguments)?),
-        Some("run") => run_supervisor(RunConfig::parse(arguments)?),
-        Some("dump") => request_dump(DumpConfig::parse(arguments)?),
-        Some("restore") => inspect_restore(RestoreConfig::parse(arguments)?),
-        Some("tui") => render_restore(TuiConfig::parse(arguments)?),
-        Some("verify-attestation") => {
-            verify_attestation_command(VerifyAttestationConfig::parse(arguments)?)
+        Some("authorize") => authorize(AuthorizeConfig::parse(arguments)?)?,
+        Some("run") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            if arguments.first().map(String::as_str) == Some("--cwd") {
+                return run_public_command(PublicRunConfig::parse(arguments)?);
+            }
+            run_supervisor(RunConfig::parse(arguments.into_iter())?)?;
         }
-        Some("capture-trace") => capture_trace(CaptureTraceConfig::parse(arguments)?),
-        _ => Err(usage().into()),
+        Some("dump") => request_dump(DumpConfig::parse(arguments)?)?,
+        Some("restore") => inspect_restore(RestoreConfig::parse(arguments)?)?,
+        Some("tui") => render_restore(TuiConfig::parse(arguments)?)?,
+        Some("verify-attestation") => {
+            verify_attestation_command(VerifyAttestationConfig::parse(arguments)?)?;
+        }
+        Some("capture-trace") => capture_trace(CaptureTraceConfig::parse(arguments)?)?,
+        _ => return Err(usage().into()),
     }
+    Ok(EntryOutcome::Success)
+}
+
+fn run_public_command(config: PublicRunConfig) -> Result<EntryOutcome, Box<dyn std::error::Error>> {
+    let mut output = io::stdout().lock();
+    let receipt = run_attested_command(
+        SupervisedRunConfig {
+            cwd: config.cwd,
+            command: config.command.into_iter().map(Into::into).collect(),
+            auth_log: config.auth_log,
+            attach_token: config.attach_token,
+            attestation_dir: config.attestation_dir,
+        },
+        &mut output,
+    )?;
+    output.flush()?;
+    let outcome = receipt.status.code().map_or_else(
+        || format!("signal:{}", receipt.status.signal().unwrap_or(0)),
+        |code| format!("code:{code}"),
+    );
+    eprintln!(
+        "remux_run\t1\nattestation\t{}\nrecords\t{}\noutput_bytes\t{}\nhead\t{}\nexit\t{}",
+        receipt_path_text(&receipt.attestation_path)?,
+        receipt.attestation.records,
+        receipt.attestation.output_bytes,
+        receipt.attestation.head_hex(),
+        outcome
+    );
+    let exit = receipt
+        .status
+        .code()
+        .unwrap_or_else(|| 128_i32.saturating_add(receipt.status.signal().unwrap_or(0)))
+        .clamp(0, 255);
+    Ok(EntryOutcome::Child(exit))
 }
 
 fn authorize(config: AuthorizeConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -87,8 +140,8 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
         if trace.records().len() != usize::try_from(config.events_per_session)? {
             return Err("events-per-session differs from recorded trace count".into());
         }
-    } else if config.trace_file.is_some() {
-        return Err("--trace requires --agent-kind trace-replay".into());
+    } else if config.trace_file.is_some() || config.trace_hold_after_ms != 0 {
+        return Err("--trace and --trace-hold-after-ms require --agent-kind trace-replay".into());
     }
     let lifecycle = consume_lifecycle_authorization(
         &config.auth_log,
@@ -235,6 +288,8 @@ fn run_supervisor(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                     path_text(trace)?,
                     "--start-delay-us",
                     &start_delay_us.to_string(),
+                    "--hold-after-trace-ms",
+                    &config.trace_hold_after_ms.to_string(),
                 ]);
                 let mut command = protect_attestation_command(
                     &command,
@@ -905,6 +960,18 @@ fn path_text(path: &Path) -> Result<&str, Box<dyn std::error::Error>> {
     path.to_str().ok_or_else(|| "path is not UTF-8".into())
 }
 
+fn receipt_path_text(path: &Path) -> Result<&str, Box<dyn std::error::Error>> {
+    let text = path_text(path)?;
+    if text
+        .bytes()
+        .any(|byte| matches!(byte, b'\t' | b'\r' | b'\n'))
+    {
+        Err("receipt path contains a control separator".into())
+    } else {
+        Ok(text)
+    }
+}
+
 struct SocketGuard(PathBuf);
 
 impl Drop for SocketGuard {
@@ -969,6 +1036,57 @@ impl TuiTarget {
     }
 }
 
+struct PublicRunConfig {
+    cwd: PathBuf,
+    command: Vec<String>,
+    auth_log: PathBuf,
+    attach_token: String,
+    attestation_dir: PathBuf,
+}
+
+impl PublicRunConfig {
+    fn parse(arguments: Vec<String>) -> Result<Self, Box<dyn std::error::Error>> {
+        let [cwd_flag, cwd, attest_flag, separator, command @ ..] = arguments.as_slice() else {
+            return Err(public_run_usage().into());
+        };
+        if cwd_flag != "--cwd"
+            || cwd.is_empty()
+            || attest_flag != "--attest"
+            || separator != "--"
+            || command.is_empty()
+            || command[0].is_empty()
+        {
+            return Err(public_run_usage().into());
+        }
+        let auth_log = env::var_os(AUTH_LOG_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("missing {AUTH_LOG_ENV}"))?;
+        let attach_token = env::var(ATTACH_TOKEN_ENV)
+            .map_err(|_| format!("missing or non-UTF-8 {ATTACH_TOKEN_ENV}"))?;
+        let attestation_dir = env::var_os(ATTESTATION_DIR_ENV).map_or_else(
+            || {
+                let base = env::var_os("HOME").map_or_else(env::temp_dir, |home| {
+                    PathBuf::from(home).join(".local/state/remux")
+                });
+                Ok::<_, Box<dyn std::error::Error>>(base.join("attestations").join(format!(
+                    "run-{}-{}",
+                    unix_micros_now()?,
+                    std::process::id()
+                )))
+            },
+            |path| Ok(PathBuf::from(path)),
+        )?;
+        receipt_path_text(&attestation_dir)?;
+        Ok(Self {
+            cwd: PathBuf::from(cwd),
+            command: command.to_vec(),
+            auth_log,
+            attach_token,
+            attestation_dir,
+        })
+    }
+}
+
 struct RunConfig {
     sessions: u32,
     events_per_session: u64,
@@ -983,6 +1101,7 @@ struct RunConfig {
     fake_agent: PathBuf,
     trace_agent: PathBuf,
     trace_file: Option<PathBuf>,
+    trace_hold_after_ms: u64,
     agent_kind: AgentKind,
     agent_shell: PathBuf,
     timeout_seconds: u64,
@@ -1009,6 +1128,7 @@ impl RunConfig {
         let mut fake_agent = sibling_binary("fake-agent")?;
         let mut trace_agent = sibling_binary("trace-agent")?;
         let mut trace_file = None;
+        let mut trace_hold_after_ms = 0;
         let mut agent_kind = AgentKind::Scripted;
         let mut agent_shell = PathBuf::from("/bin/sh");
         let mut timeout_seconds = 60;
@@ -1043,6 +1163,9 @@ impl RunConfig {
                 "--fake-agent" => fake_agent = PathBuf::from(value),
                 "--trace-agent" => trace_agent = PathBuf::from(value),
                 "--trace" => trace_file = Some(PathBuf::from(value)),
+                "--trace-hold-after-ms" => {
+                    trace_hold_after_ms = value.parse().map_err(|_| "invalid trace hold")?;
+                }
                 "--agent-kind" => agent_kind = AgentKind::parse(&value)?,
                 "--agent-shell" => agent_shell = PathBuf::from(value),
                 "--timeout-seconds" => timeout_seconds = parse_positive(&value, "timeout-seconds")?,
@@ -1071,6 +1194,7 @@ impl RunConfig {
             fake_agent,
             trace_agent,
             trace_file,
+            trace_hold_after_ms,
             agent_kind,
             agent_shell,
             timeout_seconds,
@@ -1268,6 +1392,10 @@ fn sibling_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(directory.join(name))
 }
 
+fn public_run_usage() -> &'static str {
+    "usage: REMUX_AUTH_LOG=PATH REMUX_ATTACH_TOKEN=TOKEN [REMUX_ATTESTATION_DIR=DIR] remux-supervisor run --cwd DIR --attest -- COMMAND..."
+}
+
 fn usage() -> &'static str {
-    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell|trace-replay] [--agent-shell PATH] [--trace-agent PATH] [--trace PATH] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--attestation-dir PATH] [--attestation off|hash-chain] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]\n       remux-supervisor verify-attestation --file PATH\n       remux-supervisor capture-trace --output PATH --command COMMAND --auth-log PATH --attach-token TOKEN"
+    "usage: remux-supervisor authorize --auth-log PATH --token TOKEN --scope drive|launch|relaunch\n       REMUX_AUTH_LOG=PATH REMUX_ATTACH_TOKEN=TOKEN [REMUX_ATTESTATION_DIR=DIR] remux-supervisor run --cwd DIR --attest -- COMMAND...\n       remux-supervisor run [--sessions N] [--events-per-session N] [--rate N] [--agent-kind scripted|real-shell|trace-replay] [--agent-shell PATH] [--trace-agent PATH] [--trace PATH] [--trace-hold-after-ms N] [--socket PATH] [--state PATH] [--scrollback-dir PATH] [--attestation-dir PATH] [--attestation off|hash-chain] [--metrics PATH] [--ready PATH] [--fake-agent PATH] [--timeout-seconds N] [--auth-log PATH] [--attach-token TOKEN] [--attach-scope launch|relaunch] [--drive-token TOKEN] [--initial-idle-ms N] [--tui | --tui-output PATH]\n       remux-supervisor dump --socket PATH\n       remux-supervisor restore --state PATH\n       remux-supervisor tui --state PATH [--output PATH]\n       remux-supervisor verify-attestation --file PATH\n       remux-supervisor capture-trace --output PATH --command COMMAND --auth-log PATH --attach-token TOKEN"
 }

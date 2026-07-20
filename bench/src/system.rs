@@ -67,6 +67,27 @@ pub fn selected_cpu_seconds(entries: &[ProcessEntry], selected: &BTreeSet<u32>) 
         .sum()
 }
 
+/// Returns current RSS bytes for selected processes present in one snapshot.
+pub fn selected_rss_bytes(entries: &[ProcessEntry], selected: &BTreeSet<u32>) -> u64 {
+    entries
+        .iter()
+        .filter(|entry| selected.contains(&entry.pid))
+        .map(|entry| entry.rss_kib)
+        .sum::<u64>()
+        .saturating_mul(1_024)
+}
+
+/// Number of selected PIDs present in one snapshot.
+pub fn selected_process_count(entries: &[ProcessEntry], selected: &BTreeSet<u32>) -> u64 {
+    u64::try_from(
+        entries
+            .iter()
+            .filter(|entry| selected.contains(&entry.pid))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 #[derive(Default)]
 pub struct ResourceTracker {
     peak_rss_kib: u64,

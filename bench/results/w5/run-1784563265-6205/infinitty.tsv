@@ -1,0 +1,25 @@
+schema	1
+workload_sha256	ef7890d4cd5e04360a1a952d3aefb7c0378f1c1f929ce0e2484c25eb727f66c5
+admission	pass
+load_one	4.53
+logical_cpus	10
+free_memory_percent	40
+subject	Infinitty v0.1.7 narrow Metal
+version	0.1.7@09b3e8b2aa3cec72a3c9a1db604c9c3c5235ee1c
+availability	measured-fresh-process
+workload_mode	20 app-socket panes replaying W4 trace
+sessions_requested	20
+sessions_observed	20
+preexisting_sessions	0
+events_per_session	14
+baseline_rss_bytes	66846720
+peak_rss_bytes	119701504
+steady_rss_bytes	119570432
+steady_rss_samples	119701504,119701504,119635968,119635968,119586816,119570432,119570432,119570432,119570432,119570432
+distinct_pid_count	21
+steady_pid_count	21
+fleet_spawn_wall_us	905964
+spawn_latency_p50_us	12630
+spawn_latency_p95_us	39098
+spawn_latency_p99_us	215121
+capability_gaps	App-socket pane acknowledgement is measured; persistence/passive restore, capability authorization, supervisor attestation, and event→flushed-redraw receipts are N/A.

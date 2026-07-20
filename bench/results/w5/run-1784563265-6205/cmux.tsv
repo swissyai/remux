@@ -1,0 +1,25 @@
+schema	1
+workload_sha256	ef7890d4cd5e04360a1a952d3aefb7c0378f1c1f929ce0e2484c25eb727f66c5
+admission	pass
+load_one	2.75
+logical_cpus	10
+free_memory_percent	47
+subject	cmux Ghostty-embedded incumbent
+version	0.64.19@1c22c5564
+availability	measured-resident-app
+workload_mode	20 W5-owned workspaces replaying W4 trace
+sessions_requested	20
+sessions_observed	20
+preexisting_sessions	6
+events_per_session	14
+baseline_rss_bytes	1536376832
+peak_rss_bytes	1925939200
+steady_rss_bytes	1601748992
+steady_rss_samples	1601142784,1601191936,1601486848,1601536000,1601748992,1602895872,1602863104,1602945024,1602961408
+distinct_pid_count	1249
+steady_pid_count	94
+fleet_spawn_wall_us	7012845
+spawn_latency_p50_us	313788
+spawn_latency_p95_us	455930
+spawn_latency_p99_us	487874
+capability_gaps	Installed app refused isolated second-instance probes; full tree includes 6 disclosed pre-existing workspaces. No remux-equivalent passive-restore or supervisor attestation receipt was measured.

@@ -1,0 +1,25 @@
+schema	1
+workload_sha256	ef7890d4cd5e04360a1a952d3aefb7c0378f1c1f929ce0e2484c25eb727f66c5
+admission	pass
+load_one	3.70
+logical_cpus	10
+free_memory_percent	46
+subject	cmux Ghostty-embedded incumbent
+version	0.64.19@1c22c5564
+availability	incompatible-isolated-instance
+workload_mode	N/A
+sessions_requested	20
+sessions_observed	N/A
+preexisting_sessions	N/A
+events_per_session	N/A
+baseline_rss_bytes	N/A
+peak_rss_bytes	N/A
+steady_rss_bytes	N/A
+steady_rss_samples	N/A
+distinct_pid_count	N/A
+steady_pid_count	N/A
+fleet_spawn_wall_us	N/A
+spawn_latency_p50_us	N/A
+spawn_latency_p95_us	N/A
+spawn_latency_p99_us	N/A
+capability_gaps	Binding correction 01 forbids measuring the founder's resident app; locked direct/open -na probes exposed no independent socket. Peak/steady RSS, process tree, fleet spawn, and terminal acknowledgement are N/A, never borrowed from the retained anomaly.

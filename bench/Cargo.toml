@@ -14,5 +14,9 @@ path = "src/main.rs"
 name = "fork-worker"
 path = "src/bin/fork-worker.rs"
 
+[[bin]]
+name = "glass-bench"
+path = "src/bin/glass-bench.rs"
+
 [dependencies]
 # No third-party crates: reports, sampling, and orchestration use only std.

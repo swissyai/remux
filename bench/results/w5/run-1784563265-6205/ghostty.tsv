@@ -1,0 +1,25 @@
+schema	1
+workload_sha256	ef7890d4cd5e04360a1a952d3aefb7c0378f1c1f929ce0e2484c25eb727f66c5
+admission	pass
+load_one	4.57
+logical_cpus	10
+free_memory_percent	40
+subject	ghostty vanilla Metal baseline
+version	1.3.1@332b2aefc
+availability	measured-resident-app
+workload_mode	20 AppleScript-manifest tabs replaying W4 trace
+sessions_requested	20
+sessions_observed	20
+preexisting_sessions	0
+events_per_session	14
+baseline_rss_bytes	15663104
+peak_rss_bytes	330530816
+steady_rss_bytes	330416128
+steady_rss_samples	330530816,330416128,330416128,330416128,330416128,330416128,330416128,330416128,330268672,330268672,330268672,330203136
+distinct_pid_count	41
+steady_pid_count	41
+fleet_spawn_wall_us	4523693
+spawn_latency_p50_us	178388
+spawn_latency_p95_us	294524
+spawn_latency_p99_us	492902
+capability_gaps	AppleScript create acknowledgement is measured, but Ghostty exposes no remux-equivalent supervisor attestation, passive restore receipt, or event→flushed-redraw boundary; those remain N/A.
