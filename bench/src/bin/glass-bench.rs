@@ -24,7 +24,6 @@ use bench::system::{self, ResourceTracker};
 use bench::{percentiles, Machine};
 
 const WORKLOAD_RELATIVE_PATH: &str = "bench/workloads/w5-terminal-fleet.tsv";
-const CMUX_APP: &str = "/Applications/cmux.app/Contents/MacOS/cmux";
 const CMUX_CLI: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux";
 const CMUX_INFO: &str = "/Applications/cmux.app/Contents/Info.plist";
 const GHOSTTY_APP: &str = "/Applications/Ghostty.app/Contents/MacOS/ghostty";
@@ -69,9 +68,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     write_atomic(&run_directory.join("preflight.tsv"), &preflight)?;
 
     let reproduction = format!(
-        "scripts/with_scorer_lock.sh cargo run --offline -p bench --bin glass-bench -- --workload {} --output-dir {}",
+        "scripts/with_scorer_lock.sh cargo run --offline -p bench --bin glass-bench -- --workload {} --output-dir {} --markdown-output {}",
         config.workload.display(),
-        config.output_directory.display()
+        config.output_directory.display(),
+        config.markdown_output.display()
     );
     let temporary = TemporaryDirectory::new()?;
     let workload_command = make_workload_command(
@@ -105,7 +105,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let hook_artifact = relative_artifact(&config.output_directory, &run_id, "cmux-hooks.tsv");
     let (cmux, hook) = run_cmux_arm(
         &workload,
-        &workload_command,
         reproduction.clone(),
         cmux_artifact.clone(),
         hook_artifact.clone(),
@@ -122,13 +121,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let ghostty_state = admitted_machine(&workload)?;
     let ghostty_artifact = relative_artifact(&config.output_directory, &run_id, "ghostty.tsv");
-    let ghostty = run_ghostty_arm(
-        &workload,
-        &workload_command,
-        &temporary.path,
-        reproduction.clone(),
-        ghostty_artifact.clone(),
-    )?;
+    let ghostty = run_ghostty_arm(&workload, reproduction.clone(), ghostty_artifact.clone())?;
     write_atomic(
         &run_directory.join("ghostty.tsv"),
         &render_arm_artifact(&ghostty, &ghostty_state, &workload_sha256)?,
@@ -168,10 +161,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     write_atomic(&latest_json, &json)?;
     let report_json_relative = format!("results/w5/{run_id}/report.json");
     let markdown = render_glass_markdown(&report, &report_json_relative);
-    write_atomic(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("GLASS_RESULTS.md"),
-        &markdown,
-    )?;
+    write_atomic(&workspace.join(&config.markdown_output), &markdown)?;
 
     println!("W5 glass run {run_id} PASS");
     for arm in &report.arms {
@@ -409,142 +399,32 @@ fn run_remux_arm(
 
 fn run_cmux_arm(
     workload: &GlassWorkload,
-    workload_command: &Path,
     reproduction: String,
     raw_artifact: String,
     hook_artifact: String,
 ) -> Result<(GlassArmResult, CmuxHookResult), Box<dyn std::error::Error>> {
-    if !Path::new(CMUX_APP).is_file()
-        || !Path::new(CMUX_CLI).is_file()
-        || !Path::new(CMUX_INFO).is_file()
-    {
-        return Err("installed cmux app/CLI/public manifest is absent".into());
+    if !Path::new(CMUX_CLI).is_file() || !Path::new(CMUX_INFO).is_file() {
+        return Err("installed cmux CLI/public manifest is absent".into());
     }
-    let root_pid = exact_process_pid(CMUX_APP)?;
-    let socket = cmux_socket()?;
-    let ping = cmux_output(&socket, &["ping"], None)?;
-    require_success("cmux ping", &ping)?;
     let version = format!(
         "{}@{}",
         plist_value(CMUX_INFO, "CFBundleShortVersionString")?,
         plist_value(CMUX_INFO, "CMUXCommit")?
     );
-    let before_ids = cmux_workspace_ids(&socket)?;
-    let preexisting = u32::try_from(before_ids.len())?;
-    let baseline_snapshot = system::snapshot()?;
-    let baseline_selected = system::descendants(&baseline_snapshot, root_pid);
-    let baseline_rss = system::selected_rss_bytes(&baseline_snapshot, &baseline_selected);
-    if baseline_rss == 0 {
-        return Err("cmux baseline process tree is absent".into());
-    }
-    let mut resources = ResourceTracker::default();
-    resources.observe(&baseline_snapshot, &baseline_selected);
-    let mut owned = Vec::new();
-    let mut spawn_latencies = Vec::new();
-    let started = Instant::now();
-    let result = (|| -> Result<(GlassArmResult, CmuxHookResult), Box<dyn std::error::Error>> {
-        for index in 0..workload.sessions {
-            let name = format!("W5-GLASS-{}-{index:02}", std::process::id());
-            let launched = Instant::now();
-            let output = cmux_output(
-                &socket,
-                &[
-                    "--id-format",
-                    "uuids",
-                    "new-workspace",
-                    "--name",
-                    &name,
-                    "--cwd",
-                    "/tmp",
-                    "--command",
-                    path_text(workload_command)?,
-                    "--no-focus",
-                ],
-                None,
-            )?;
-            require_success("cmux new-workspace", &output)?;
-            spawn_latencies.push(u64::try_from(launched.elapsed().as_micros())?);
-            let id = first_uuid(&String::from_utf8(output.stdout)?)
-                .ok_or("cmux new-workspace returned no UUID")?;
-            if !owned.insert_unique(id) {
-                return Err("cmux returned a duplicate benchmark workspace".into());
-            }
-            observe_root(root_pid, &mut resources)?;
-        }
-        let fleet_spawn_wall_us = u64::try_from(started.elapsed().as_micros())?;
-        let after_ids = cmux_workspace_ids(&socket)?;
-        let owned_set = owned.iter().cloned().collect::<BTreeSet<_>>();
-        if !owned_set.is_subset(&after_ids) || after_ids.len() != before_ids.len() + owned.len() {
-            return Err("cmux W5 workspace ownership/shape differs".into());
-        }
-        require_session_shape(u32::try_from(owned.len())?, workload)?;
-        wait_trace_completion_without_child(root_pid, workload, &mut resources)?;
-        let (steady_rss_samples, steady_pid_count) = sample_steady(
-            root_pid,
-            workload,
-            &mut resources,
-            None,
-            arm_deadline(workload)?,
-        )?;
-        let hook = run_cmux_hooks(&socket, &version, workload.cmux_hook_events, hook_artifact)?;
-        let peak = resources.peak_rss_bytes();
-        let steady = median(&steady_rss_samples)?;
-        require_metrics(
-            peak,
-            steady,
-            resources.distinct_pid_count(),
-            steady_pid_count,
-        )?;
-        Ok((
-            GlassArmResult {
-                subject: "cmux Ghostty-embedded incumbent".to_owned(),
-                version: version.clone(),
-                availability: "measured-resident-app".to_owned(),
-                workload_mode: "20 W5-owned workspaces replaying W4 trace".to_owned(),
-                sessions_requested: workload.sessions,
-                sessions_observed: Some(workload.sessions),
-                preexisting_sessions: Some(preexisting),
-                events_per_session: Some(workload.trace_records_per_session),
-                baseline_rss_bytes: Some(baseline_rss),
-                peak_rss_bytes: Some(peak),
-                steady_rss_bytes: Some(steady),
-                steady_rss_samples,
-                distinct_pid_count: Some(resources.distinct_pid_count()),
-                steady_pid_count: Some(steady_pid_count),
-                fleet_spawn_wall_us: Some(fleet_spawn_wall_us),
-                spawn_latency_us: Some(percentiles(&spawn_latencies)?),
-                reproduction: Some(reproduction),
-                capability_gaps: format!(
-                    "Installed app refused isolated second-instance probes; full tree includes {preexisting} disclosed pre-existing workspaces. No remux-equivalent passive-restore or supervisor attestation receipt was measured."
-                ),
-                raw_artifact,
-            },
-            hook,
-        ))
-    })();
-    for id in owned.iter().rev() {
-        let _ = cmux_output(&socket, &["close-workspace", "--workspace", id], None);
-    }
-    let final_ids = cmux_workspace_ids(&socket)?;
-    if final_ids != before_ids {
-        return Err("cmux cleanup did not restore the pre-run workspace set".into());
-    }
-    result
-}
-
-trait InsertUnique<T> {
-    fn insert_unique(&mut self, value: T) -> bool;
-}
-
-impl<T: Eq> InsertUnique<T> for Vec<T> {
-    fn insert_unique(&mut self, value: T) -> bool {
-        if self.contains(&value) {
-            false
-        } else {
-            self.push(value);
-            true
-        }
-    }
+    let socket = cmux_socket()?;
+    let ping = cmux_output(&socket, &["ping"], None)?;
+    require_success("cmux ping", &ping)?;
+    let hook = run_cmux_hooks(&socket, &version, workload.cmux_hook_events, hook_artifact)?;
+    let mut arm = unavailable_arm(
+        "cmux Ghostty-embedded incumbent",
+        "incompatible-isolated-instance",
+        workload,
+        reproduction,
+        "Binding correction 01 forbids measuring the founder's resident app; locked direct/open -na probes exposed no independent socket. Peak/steady RSS, process tree, fleet spawn, and terminal acknowledgement are N/A, never borrowed from the retained anomaly.",
+        raw_artifact,
+    );
+    arm.version = version;
+    Ok((arm, hook))
 }
 
 fn run_cmux_hooks(
@@ -611,8 +491,6 @@ fn run_cmux_hooks(
 
 fn run_ghostty_arm(
     workload: &GlassWorkload,
-    workload_command: &Path,
-    temporary_root: &Path,
     reproduction: String,
     raw_artifact: String,
 ) -> Result<GlassArmResult, Box<dyn std::error::Error>> {
@@ -626,94 +504,20 @@ fn run_ghostty_arm(
             raw_artifact,
         ));
     }
-    let root_pid = exact_process_pid(GHOSTTY_APP)?;
-    let version = format!(
+    let mut arm = unavailable_arm(
+        "ghostty vanilla Metal baseline",
+        "incompatible-isolated-instance",
+        workload,
+        reproduction,
+        "Binding correction 01 forbids the founder's resident app. The installed public AppleScript dictionary cannot target one secondary app PID, so a clean 20-session process tree is unavailable and every metric is N/A.",
+        raw_artifact,
+    );
+    arm.version = format!(
         "{}@{}",
         plist_value(GHOSTTY_INFO, "CFBundleShortVersionString")?,
         plist_value(GHOSTTY_INFO, "GhosttyCommit")?
     );
-    let script = temporary_root.join("ghostty-w5.applescript");
-    fs::write(&script, ghostty_script())?;
-    let before = ghostty_number(&script, &["total"])?;
-    let baseline_snapshot = system::snapshot()?;
-    let baseline_selected = system::descendants(&baseline_snapshot, root_pid);
-    let baseline_rss = system::selected_rss_bytes(&baseline_snapshot, &baseline_selected);
-    let mut resources = ResourceTracker::default();
-    resources.observe(&baseline_snapshot, &baseline_selected);
-    let mut window_id = None;
-    let mut spawn_latencies = Vec::new();
-    let started = Instant::now();
-    let result = (|| -> Result<GlassArmResult, Box<dyn std::error::Error>> {
-        let launched = Instant::now();
-        let created = ghostty_output(&script, &["create", path_text(workload_command)?, "/tmp"])?;
-        require_success("Ghostty new window", &created)?;
-        spawn_latencies.push(u64::try_from(launched.elapsed().as_micros())?);
-        let id = String::from_utf8(created.stdout)?.trim().to_owned();
-        if id.is_empty() || id.bytes().any(|byte| byte.is_ascii_whitespace()) {
-            return Err("Ghostty returned an invalid W5 window id".into());
-        }
-        window_id = Some(id.clone());
-        observe_root(root_pid, &mut resources)?;
-        for _ in 1..workload.sessions {
-            let launched = Instant::now();
-            let output =
-                ghostty_output(&script, &["add", &id, path_text(workload_command)?, "/tmp"])?;
-            require_success("Ghostty new tab", &output)?;
-            spawn_latencies.push(u64::try_from(launched.elapsed().as_micros())?);
-            observe_root(root_pid, &mut resources)?;
-        }
-        let fleet_spawn_wall_us = u64::try_from(started.elapsed().as_micros())?;
-        require_session_shape(ghostty_number(&script, &["window", &id])?, workload)?;
-        let total = ghostty_number(&script, &["total"])?;
-        if total != before + workload.sessions {
-            return Err("Ghostty total session shape differs after W5 creation".into());
-        }
-        wait_trace_completion_without_child(root_pid, workload, &mut resources)?;
-        let (steady_rss_samples, steady_pid_count) = sample_steady(
-            root_pid,
-            workload,
-            &mut resources,
-            None,
-            arm_deadline(workload)?,
-        )?;
-        let peak = resources.peak_rss_bytes();
-        let steady = median(&steady_rss_samples)?;
-        require_metrics(
-            peak,
-            steady,
-            resources.distinct_pid_count(),
-            steady_pid_count,
-        )?;
-        Ok(GlassArmResult {
-            subject: "ghostty vanilla Metal baseline".to_owned(),
-            version,
-            availability: "measured-resident-app".to_owned(),
-            workload_mode: "20 AppleScript-manifest tabs replaying W4 trace".to_owned(),
-            sessions_requested: workload.sessions,
-            sessions_observed: Some(workload.sessions),
-            preexisting_sessions: Some(before),
-            events_per_session: Some(workload.trace_records_per_session),
-            baseline_rss_bytes: Some(baseline_rss),
-            peak_rss_bytes: Some(peak),
-            steady_rss_bytes: Some(steady),
-            steady_rss_samples,
-            distinct_pid_count: Some(resources.distinct_pid_count()),
-            steady_pid_count: Some(steady_pid_count),
-            fleet_spawn_wall_us: Some(fleet_spawn_wall_us),
-            spawn_latency_us: Some(percentiles(&spawn_latencies)?),
-            reproduction: Some(reproduction),
-            capability_gaps: "AppleScript create acknowledgement is measured, but Ghostty exposes no remux-equivalent supervisor attestation, passive restore receipt, or event→flushed-redraw boundary; those remain N/A.".to_owned(),
-            raw_artifact,
-        })
-    })();
-    if let Some(id) = &window_id {
-        let _ = ghostty_output(&script, &["close", id]);
-    }
-    let after = ghostty_number(&script, &["total"])?;
-    if after != before {
-        return Err("Ghostty cleanup did not restore the pre-run terminal count".into());
-    }
-    result
+    Ok(arm)
 }
 
 fn run_infinitty_arm(
@@ -759,6 +563,7 @@ fn run_infinitty_arm(
     let mut child = Command::new(binary)
         .env("INFINITTY_CONFIG", &config)
         .env("INFINITTY_NO_ACTIVATE", "1")
+        .env("NTAP_DONE", "1")
         .env("SHELL", workload_command)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -948,10 +753,17 @@ fn validate_complete_report(
             if arm.fleet_spawn_wall_us.unwrap_or(0) == 0 {
                 return Err("measured arm misses spawn cost".into());
             }
-        } else if arm.peak_rss_bytes.is_some()
+        } else if arm.sessions_observed.is_some()
+            || arm.preexisting_sessions.is_some()
+            || arm.events_per_session.is_some()
+            || arm.baseline_rss_bytes.is_some()
+            || arm.peak_rss_bytes.is_some()
             || arm.steady_rss_bytes.is_some()
+            || !arm.steady_rss_samples.is_empty()
             || arm.distinct_pid_count.is_some()
+            || arm.steady_pid_count.is_some()
             || arm.fleet_spawn_wall_us.is_some()
+            || arm.spawn_latency_us.is_some()
         {
             return Err("unavailable arm contains guessed measurements".into());
         }
@@ -1077,7 +889,7 @@ fn make_workload_command(
     fs::write(
         &path,
         format!(
-            "#!/bin/sh\nexec {trace_agent} --trace {trace} --start-delay-us 0 --hold-after-trace-ms {hold_ms}\n"
+            "#!/bin/sh\nexport NTAP_DONE=1\nexec {trace_agent} --trace {trace} --start-delay-us 0 --hold-after-trace-ms {hold_ms}\n"
         ),
     )?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
@@ -1086,59 +898,6 @@ fn make_workload_command(
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn ghostty_script() -> &'static str {
-    r#"on run argv
-set operation to item 1 of argv
-using terms from application "Ghostty"
-tell application id "com.mitchellh.ghostty"
-if operation is "total" then
-return (count of terminals) as text
-else if operation is "create" then
-set commandText to item 2 of argv
-set workdir to item 3 of argv
-set config to new surface configuration from {initial working directory:workdir, command:commandText, wait after command:true}
-set targetWindow to new window with configuration config
-return (id of targetWindow) as text
-else
-set targetId to item 2 of argv
-set matches to every window whose id is targetId
-if (count of matches) is not 1 then error "Ghostty W5 window not found"
-set targetWindow to item 1 of matches
-if operation is "add" then
-set commandText to item 3 of argv
-set workdir to item 4 of argv
-set config to new surface configuration from {initial working directory:workdir, command:commandText, wait after command:true}
-set createdTab to new tab in targetWindow with configuration config
-return (id of createdTab) as text
-else if operation is "window" then
-return (count of terminals of targetWindow) as text
-else if operation is "close" then
-close window targetWindow
-return "closed"
-else
-error "unknown Ghostty W5 operation"
-end if
-end if
-end tell
-end using terms from
-end run
-"#
-}
-
-fn ghostty_output(script: &Path, arguments: &[&str]) -> io::Result<Output> {
-    Command::new("/usr/bin/osascript")
-        .arg(script)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .output()
-}
-
-fn ghostty_number(script: &Path, arguments: &[&str]) -> Result<u32, Box<dyn std::error::Error>> {
-    let output = ghostty_output(script, arguments)?;
-    require_success("Ghostty AppleScript count", &output)?;
-    Ok(String::from_utf8(output.stdout)?.trim().parse()?)
 }
 
 fn cmux_socket() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -1182,34 +941,6 @@ fn cmux_output(socket: &Path, arguments: &[&str], input: Option<&[u8]>) -> io::R
             .write_all(bytes)?;
     }
     child.wait_with_output()
-}
-
-fn cmux_workspace_ids(socket: &Path) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
-    let output = cmux_output(socket, &["--id-format", "uuids", "list-workspaces"], None)?;
-    require_success("cmux list-workspaces", &output)?;
-    let text = String::from_utf8(output.stdout)?;
-    let ids = text.lines().filter_map(first_uuid).collect::<BTreeSet<_>>();
-    if ids.is_empty() && !text.trim().is_empty() {
-        return Err("cmux workspace list contains no parseable UUID".into());
-    }
-    Ok(ids)
-}
-
-fn first_uuid(line: &str) -> Option<String> {
-    line.split_whitespace()
-        .find(|field| is_uuid(field))
-        .map(ToOwned::to_owned)
-}
-
-fn is_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 fn infinitty_candidates() -> Vec<PathBuf> {
@@ -1302,22 +1033,6 @@ fn wait_trace_completion(
         if Instant::now() >= deadline {
             return Err("subject timed out before trace completion".into());
         }
-        thread::sleep(sample_interval(workload));
-    }
-    Ok(())
-}
-
-fn wait_trace_completion_without_child(
-    root_pid: u32,
-    workload: &GlassWorkload,
-    resources: &mut ResourceTracker,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let wait = Duration::from_micros(workload.trace_last_event_us.saturating_add(250_000));
-    let until = Instant::now()
-        .checked_add(wait)
-        .ok_or("trace wait overflow")?;
-    while Instant::now() < until {
-        observe_root(root_pid, resources)?;
         thread::sleep(sample_interval(workload));
     }
     Ok(())
@@ -1522,24 +1237,6 @@ fn parse_u64_field(fields: &BTreeMap<String, String>, key: &str) -> io::Result<u
         .map_err(|_| io::Error::other(format!("field {key} invalid")))
 }
 
-fn exact_process_pid(command_path: &str) -> Result<u32, Box<dyn std::error::Error>> {
-    let output = command_output("/bin/ps", &["-axo", "pid=,comm="])?;
-    let pids = output
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse::<u32>().ok()?;
-            let command = fields.next()?;
-            (command == command_path).then_some(pid)
-        })
-        .collect::<Vec<_>>();
-    match pids.as_slice() {
-        [pid] => Ok(*pid),
-        [] => Err(format!("subject process is not running: {command_path}").into()),
-        _ => Err(format!("multiple subject processes are running: {command_path}").into()),
-    }
-}
-
 fn plist_value(path: &str, key: &str) -> io::Result<String> {
     command_output("/usr/bin/plutil", &["-extract", key, "raw", path])
 }
@@ -1629,12 +1326,6 @@ fn read_stderr(child: &mut Child) -> io::Result<String> {
 
 fn median(samples: &[u64]) -> Result<u64, Box<dyn std::error::Error>> {
     Ok(percentiles(samples)?.p50)
-}
-
-fn arm_deadline(workload: &GlassWorkload) -> Result<Instant, Box<dyn std::error::Error>> {
-    Instant::now()
-        .checked_add(Duration::from_secs(workload.arm_timeout_seconds))
-        .ok_or_else(|| "arm deadline overflow".into())
 }
 
 fn sample_interval(workload: &GlassWorkload) -> Duration {
@@ -1735,12 +1426,14 @@ impl Drop for TemporaryDirectory {
 struct Config {
     workload: PathBuf,
     output_directory: PathBuf,
+    markdown_output: PathBuf,
 }
 
 impl Config {
     fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, Box<dyn std::error::Error>> {
         let mut workload = PathBuf::from(WORKLOAD_RELATIVE_PATH);
         let mut output_directory = PathBuf::from("bench/results/w5");
+        let mut markdown_output = PathBuf::from("bench/GLASS_RESULTS.md");
         let mut arguments = arguments;
         while let Some(flag) = arguments.next() {
             let value = arguments
@@ -1749,41 +1442,30 @@ impl Config {
             match flag.as_str() {
                 "--workload" => workload = PathBuf::from(value),
                 "--output-dir" => output_directory = PathBuf::from(value),
+                "--markdown-output" => markdown_output = PathBuf::from(value),
                 _ => return Err(format!("unknown glass-bench flag {flag}").into()),
             }
         }
-        if workload.is_absolute() || output_directory.is_absolute() {
+        if workload.is_absolute() || output_directory.is_absolute() || markdown_output.is_absolute()
+        {
             return Err("glass-bench paths must be workspace-relative".into());
         }
         Ok(Self {
             workload,
             output_directory,
+            markdown_output,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{first_uuid, is_uuid, parse_infinitty_ids, Config, WORKLOAD_RELATIVE_PATH};
+    use super::{parse_infinitty_ids, Config, WORKLOAD_RELATIVE_PATH};
     use std::collections::BTreeSet;
     use std::path::Path;
 
     #[test]
     fn public_subject_identifiers_fail_closed() {
-        let id = "5E044570-9C7E-445F-8775-5C1472ABC515";
-        assert!(is_uuid(id));
-        assert_eq!(
-            first_uuid(&format!("workspace:1 {id} title")).as_deref(),
-            Some(id)
-        );
-        for invalid in [
-            "5E0445709C7E445F87755C1472ABC515",
-            "5E044570-9C7E-445F-8775-5C1472ABC51Z",
-            "../../owned",
-            "",
-        ] {
-            assert!(!is_uuid(invalid));
-        }
         assert_eq!(
             parse_infinitty_ids(r#"[{"id":1},{"id": 20}]"#).expect("parse pane ids"),
             BTreeSet::from([1, 20])
@@ -1797,10 +1479,15 @@ mod tests {
     fn config_is_bounded_to_workspace_relative_paths() {
         let default = Config::parse(std::iter::empty()).expect("parse default glass config");
         assert_eq!(default.workload, Path::new(WORKLOAD_RELATIVE_PATH));
+        assert_eq!(default.markdown_output, Path::new("bench/GLASS_RESULTS.md"));
         assert!(Config::parse(["--workload".to_owned()].into_iter()).is_err());
         assert!(
             Config::parse(["--output-dir".to_owned(), "/tmp/out".to_owned()].into_iter()).is_err()
         );
+        assert!(Config::parse(
+            ["--markdown-output".to_owned(), "/tmp/report".to_owned()].into_iter()
+        )
+        .is_err());
         assert!(Config::parse(["--unknown".to_owned(), "x".to_owned()].into_iter()).is_err());
     }
 }

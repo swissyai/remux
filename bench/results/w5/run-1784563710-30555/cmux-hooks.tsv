@@ -1,0 +1,16 @@
+schema	1
+workload_sha256	ef7890d4cd5e04360a1a952d3aefb7c0378f1c1f929ce0e2484c25eb727f66c5
+admission	pass
+load_one	3.70
+logical_cpus	10
+free_memory_percent	46
+version	0.64.19@1c22c5564
+events	5
+distinct_hook_pids	5
+per_event_forks	1.000000
+peak_hook_rss_bytes	13975552
+wall_p50_us	163986
+wall_p95_us	177388
+wall_p99_us	177388
+command	printf '{}\n' | CMUX_SOCKET_PATH=... cmux hooks pi event
+observation	Each accepted event launched a separate current cmux CLI process; the 2026-07-15 0.37–0.38s/18–21MB figure is refreshed, not copied forward.

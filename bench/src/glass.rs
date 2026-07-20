@@ -261,6 +261,7 @@ pub fn render_glass_markdown(report: &GlassReport, json_path: &str) -> String {
         report.machine.architecture, report.workload_path, report.workload_sha256,
         report.preflight_artifact, json_path, json_path
     );
+    output.push_str("Machine-state axis: this machine's interactive zsh startup includes a custom agent picker. Binding correction 01 excludes the founder's resident cmux/Ghostty instances; every measured foreign session uses a direct non-interactive workload and `NTAP_DONE=1`. Pre-correction resident rows are retained anomalies, never promoted here.\n\n");
     output.push_str("| Terminal layer | Availability | Workload | Sessions | Pre-existing | Peak RSS (MiB) | Steady RSS (MiB) | Distinct / steady PIDs | Fleet spawn (ms) | Per-session ack p95 (ms) | Capability gaps | Raw |\n");
     output.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|\n");
     for arm in &report.arms {
@@ -299,7 +300,7 @@ pub fn render_glass_markdown(report: &GlassReport, json_path: &str) -> String {
     );
     output.push_str("|---|---|---|---|\n");
     output.push_str("| std-only TUI as-is | Already owns passive restore, exact capabilities, attestation, idle/redraw gates, and the measured remux arm without a renderer dependency. | **Stay TUI now.** Preserve the lowest-complexity substrate while real consumers exercise the public run route. | A production workflow shows a glass limitation with accepted-outcome, latency, or retention harm. |\n");
-    output.push_str("| embed libghostty | Ghostty vanilla supplies the nearest glass baseline and mature Metal terminal behavior, but W5 measures an app binary, not libghostty ABI/integration cost; persistence and remux attestation remain ours. | **Shadow as the first glass adoption candidate; do not adopt this wave.** | Offline prototype measures end-to-end RSS/redraw/build surface and beats TUI on a named consumer enough to pay its dependency/FFI tax. |\n");
+    output.push_str("| embed libghostty | The installed Ghostty manifest confirms the nearest mature Metal path, but correction 01 makes its resident app off-limits and its public control surface cannot target a clean secondary PID; terminal-layer cost is N/A. W5 does not measure libghostty ABI/integration cost. | **Shadow only; do not adopt this wave.** The missing isolated baseline weakens, not strengthens, an adoption case. | A hermetic isolated prototype measures end-to-end RSS/redraw/build surface and beats TUI on a named consumer enough to pay its dependency/FFI tax. |\n");
     output.push_str("| narrow Metal renderer | Infinitty is an existence proof for a small resident Metal terminal, not evidence that rebuilding terminal correctness creates a 10x consumer gain. It adds the largest bespoke maintenance surface. | **Park.** Build-vs-adopt law is not met. | libghostty cannot satisfy a required measured capability, and a narrow prototype demonstrates roughly 10x outcome advantage under a fixed budget. |\n");
     output
         .push_str("\nNo renderer dependency, FFI, telemetry, or display code was adopted in W5.\n");
