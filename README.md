@@ -15,12 +15,17 @@ handed between people. A session that exists only inside one terminal window
 can't be handed off, audited, or trusted after the fact. remux treats the
 session as the durable object and the window as a view:
 
-- Sessions outlive windows. The supervisor owns PTYs, layout, and scrollback;
-  a crash or detach loses nothing, and restore never re-executes anything.
-- Driving is granted, not ambient. Launch and relaunch consume single-use,
-  logged authorizations, so every handoff leaves an audit trail.
-- Runs can be verified without being watched. `--attest` emits an externally
-  verifiable chain receipt for the command a session actually ran.
+- Sessions outlive windows. The supervisor owns PTYs, layout, and scrollback, and
+  restore never re-executes anything. Durability is checkpoint-based: state and
+  scrollback are written on an explicit dump and at shutdown, so an unclean kill
+  can still lose the tail since the last checkpoint.
+- Driving is granted, not ambient. Launching or relaunching a session consumes a
+  single-use, logged authorization, so picking a session up is an explicit
+  recorded act rather than an implicit one.
+- Runs can be verified without being watched. `--attest` emits a hash-chained
+  receipt an external verifier checks for integrity and ordering. It is a chain,
+  not a signature: it establishes that the recorded sequence is intact and in
+  what order, not who a participant is.
 
 Live shared attach — several people viewing and driving one session — is not
 built yet. The pieces above are the substrate it needs: session state that no
