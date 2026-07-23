@@ -8,29 +8,6 @@ on every tool call (measured at ~0.36s and 18MB per fork); at fleet scale that p
 into gigabytes of burst load. remux is built against that failure mode, with the benchmarks
 kept in-repo.
 
-## Why sessions live in the supervisor
-
-Agent runs are getting longer — hours instead of seconds — and long runs get
-handed between people. A session that exists only inside one terminal window
-can't be handed off, audited, or trusted after the fact. remux treats the
-session as the durable object and the window as a view:
-
-- Sessions outlive windows. The supervisor owns PTYs, layout, and scrollback, and
-  restore never re-executes anything. Durability is checkpoint-based: state and
-  scrollback are written on an explicit dump and at shutdown, so an unclean kill
-  can still lose the tail since the last checkpoint.
-- Driving is granted, not ambient. Launching or relaunching a session consumes a
-  single-use, logged authorization, so picking a session up is an explicit
-  recorded act rather than an implicit one.
-- Runs can be verified without being watched. `--attest` emits a hash-chained
-  receipt an external verifier checks for integrity and ordering. It is a chain,
-  not a signature: it establishes that the recorded sequence is intact and in
-  what order, not who a participant is.
-
-Live shared attach — several people viewing and driving one session — is not
-built yet. The pieces above are the substrate it needs: session state that no
-single window owns, and an authorization log that says who did what.
-
 ## Design
 
 - One resident process; no per-event forks. Session status is tracked in-process.
@@ -39,7 +16,8 @@ single window owns, and an authorization log that says who did what.
   restore; relaunch goes through an explicit gate.
 - Attested runs: `remux-supervisor run --cwd DIR --attest -- COMMAND...` preserves command
   stdout and emits an externally verifiable chain receipt on stderr, behind a prior
-  single-use lifecycle grant.
+  single-use lifecycle grant. The receipt is a hash chain, not a signature: it establishes
+  that the recorded sequence is intact and in what order, not who ran it.
 - Notifications and auto-naming exist but are off by default. No embedded browser, no feed,
   no cloud presence, no analytics, no NODE_OPTIONS preload injection.
 - Memory budget: under 200MB resident for a 20-session fleet.
