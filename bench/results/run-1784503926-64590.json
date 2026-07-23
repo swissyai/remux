@@ -115,13 +115,13 @@
   "infinitty_result": {
     "model": "infinitty_v0.1.7_macos",
     "availability": "measured",
-    "probe_paths": ["/Applications/Infinitty.app/Contents/MacOS/Infinitty", "/Applications/Infinitty.app/Contents/MacOS/infinitty", "/Users/dev/Applications/Infinitty.app/Contents/MacOS/Infinitty", "/Users/dev/Applications/Infinitty.app/Contents/MacOS/infinitty", "/private/tmp/build/-Users-dev-founder-mode-remux/b3217d96-b2b9-4c01-9cdc-87d2ba58058c/scratchpad/repo/.build/release/infinitty"],
+    "probe_paths": ["/Applications/Infinitty.app/Contents/MacOS/Infinitty", "/Applications/Infinitty.app/Contents/MacOS/infinitty", "<local-path>/Applications/Infinitty.app/Contents/MacOS/Infinitty", "<local-path>/Applications/Infinitty.app/Contents/MacOS/infinitty", "<local-path>/infinitty"],
     "sessions": 20,
     "events": 19,
     "processes_spawned": 21,
     "peak_rss_bytes": 153010176,
     "latency_us": {"p50": 17996, "p95": 79563, "p99": 79563},
-    "reproduce": "INFINITTY_APP=/private/tmp/build/-Users-dev-founder-mode-remux/b3217d96-b2b9-4c01-9cdc-87d2ba58058c/scratchpad/repo/.build/release/infinitty scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
+    "reproduce": "INFINITTY_APP=<local-path>/infinitty scripts/with_scorer_lock.sh cargo run -p bench -- --sessions 20 --events-per-session 6 --rate 20 --fork-hold-ms 360 --fork-cpu-ms 30 --fork-rss-mib 18",
     "feature_gap": "Measured latency is app-socket new-tab request→pane-id for 19 additions to one initial pane. The distinct-PID union may include transient shell-startup helpers; steady snapshots enforce one app + 20 resident shells. Infinitty exposes no event→flushed-redraw receipt and has no persistence/restore or attestation, so those cells remain N/A."
   }
 }

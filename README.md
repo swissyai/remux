@@ -48,3 +48,45 @@ baseline.
 Run all build/test/benchmark commands through `scripts/with_scorer_lock.sh`; Cargo is
 forced offline. See `CONTEXT.md` for stable domain terms and `AGENTS.md` for the
 clean-room and engineering rules.
+
+## Provenance
+
+The W1–W3 clean-room records state:
+
+From `research/W1-notes.md`:
+
+> - Clean-room attestation: W1 was implemented from this repository's goal and standard
+>   operating-system/Rust interfaces. `../cmux-upstream` and all GPL source were never
+>   opened, copied, or paraphrased.
+> - The only cmux comparison facts used are the existing receipt in
+>   `research/2026-07-15-cmux-investigation.md`: observed hook lifetime 0.37–0.38s,
+>   transient RSS 18–21MB, and a Unix-socket message path. Those facts were already in
+>   remux before W1; behavior observed, no code copied.
+
+From `research/W2-notes.md`:
+
+> - Clean-room attestation: W2 was implemented from this repository's W2 goal, W1
+>   interfaces, and standard operating-system/Rust interfaces. `../cmux-upstream` and
+>   all GPL source were never opened, copied, paraphrased, or consulted.
+> - No new upstream behavioral fact was used in this wave. The socket and incident facts
+>   inherited from W1 were already recorded in `research/W1-notes.md`; behavior
+>   observed, no code copied.
+> - W2 added no dependency, telemetry, network operation, paid model invocation, or
+>   publish/deploy action. The real command is the machine's `/bin/sh` running a
+>   long-lived built-in read/print loop.
+
+From `research/W3-notes.md`:
+
+> - W3 is being implemented only from this repository's goals, prior-wave
+>   interfaces, Rust/std documentation knowledge, and the permitted Infinitty
+>   leverage-plan lanes 2–3. `../cmux-upstream` and all GPL source are not opened,
+>   copied, paraphrased, or consulted.
+> - No Infinitty source file has been opened. The only inherited observations are
+>   from `research/2026-07-18-infinitty-leverage-plan.md`: visible agent control and
+>   event-driven idle-zero rendering. No code or line-level expression was copied.
+> - No dependency, telemetry, network operation, paid invocation, publish, or
+>   deploy action is planned. Cargo remains offline.
+
+The workspace has zero third-party crates: it is std-only, enforced by the offline
+Cargo configuration. cmux source has never been present in this repository; only
+behavioral facts from published receipts were used.

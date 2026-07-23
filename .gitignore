@@ -2,3 +2,4 @@ target/
 .build-agent.pid
 .build-agent.pid.child
 goals/*/logs/
+.DS_Store
