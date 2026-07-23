@@ -8,6 +8,24 @@ on every tool call (measured at ~0.36s and 18MB per fork); at fleet scale that p
 into gigabytes of burst load. remux is built against that failure mode, with the benchmarks
 kept in-repo.
 
+## Why sessions live in the supervisor
+
+Agent runs are getting longer — hours instead of seconds — and long runs get
+handed between people. A session that exists only inside one terminal window
+can't be handed off, audited, or trusted after the fact. remux treats the
+session as the durable object and the window as a view:
+
+- Sessions outlive windows. The supervisor owns PTYs, layout, and scrollback;
+  a crash or detach loses nothing, and restore never re-executes anything.
+- Driving is granted, not ambient. Launch and relaunch consume single-use,
+  logged authorizations, so every handoff leaves an audit trail.
+- Runs can be verified without being watched. `--attest` emits an externally
+  verifiable chain receipt for the command a session actually ran.
+
+Live shared attach — several people viewing and driving one session — is not
+built yet. The pieces above are the substrate it needs: session state that no
+single window owns, and an authorization log that says who did what.
+
 ## Design
 
 - One resident process; no per-event forks. Session status is tracked in-process.
