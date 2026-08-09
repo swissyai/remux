@@ -1,0 +1,5 @@
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -840,1 +840,1 @@
+-        .cursor_visible => out.* = t.modes.get(.cursor_visible),
++        .cursor_visible => out.* = !t.modes.get(.cursor_visible),

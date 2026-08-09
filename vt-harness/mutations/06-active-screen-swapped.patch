@@ -1,0 +1,5 @@
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -839,1 +839,1 @@
+-        .active_screen => out.* = t.screens.active_key,
++        .active_screen => out.* = if (t.screens.active_key == .primary) .alternate else .primary,

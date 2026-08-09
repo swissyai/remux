@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "gitSha": "80e33e7672301ebd418520e083b5853ef9c578d5",
+  "timestamp": "2026-08-06T14:18:56-04:00",
+  "authoredCases": 425,
+  "streamCorpora": 20,
+  "streamBytes": 5400000,
+  "adversarialCases": 120,
+  "invariantProperties": 15,
+  "plantedMutations": 14,
+  "mutationsKilled": 14,
+  "mutationKills": [
+    {"id": "M01-cols-off-by-one", "detectedBy": "mutation-probe:geometry-cols"},
+    {"id": "M02-rows-off-by-one", "detectedBy": "mutation-probe:geometry-rows"},
+    {"id": "M03-cursor-x-shift", "detectedBy": "mutation-probe:cursor-x"},
+    {"id": "M04-cursor-y-shift", "detectedBy": "mutation-probe:cursor-y"},
+    {"id": "M05-pending-wrap-inverted", "detectedBy": "mutation-probe:pending-wrap"},
+    {"id": "M06-active-screen-swapped", "detectedBy": "mutation-probe:active-screen"},
+    {"id": "M07-cursor-visible-inverted", "detectedBy": "mutation-probe:cursor-visible"},
+    {"id": "M08-mouse-tracking-inverted", "detectedBy": "mutation-probe:mouse-tracking"},
+    {"id": "M09-total-rows-off-by-one", "detectedBy": "mutation-probe:total-rows"},
+    {"id": "M10-scrollback-off-by-one", "detectedBy": "mutation-probe:scrollback-rows"},
+    {"id": "M11-width-pixels-off-by-one", "detectedBy": "mutation-probe:width-pixels"},
+    {"id": "M12-mode-query-inverted", "detectedBy": "mutation-probe:mode-query"},
+    {"id": "M13-erase-complete-short", "detectedBy": "mutation-probe:content-erase-complete"},
+    {"id": "M14-erase-right-short", "detectedBy": "mutation-probe:content-erase-right"}
+  ],
+  "fuzzExecutions": 100000,
+  "fuzzDivergences": 0,
+  "durationsSec": {
+    "authored": 0.065453,
+    "streams": 0.319580,
+    "adversarial": 0.020901,
+    "invariants": 0.000776,
+    "differential": 0.016530,
+    "mutations": 231.901888,
+    "fuzz": 2.066813,
+    "total": 234.401448
+  },
+  "pass": true
+}

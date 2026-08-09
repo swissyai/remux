@@ -1,0 +1,9 @@
+[package]
+name = "vt-harness"
+version = "0.1.0"
+edition.workspace = true
+# The locked libghostty-vt wrapper requires a newer compiler than the trust core.
+rust-version = "1.94"
+
+[dependencies]
+libghostty-vt = "0.2.1"

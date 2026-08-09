@@ -1,0 +1,5 @@
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -838,1 +838,1 @@
+-        .cursor_pending_wrap => out.* = t.screens.active.cursor.pending_wrap,
++        .cursor_pending_wrap => out.* = !t.screens.active.cursor.pending_wrap,

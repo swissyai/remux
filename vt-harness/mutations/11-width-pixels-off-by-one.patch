@@ -1,0 +1,5 @@
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -859,1 +859,1 @@
+-        .width_px => out.* = t.width_px,
++        .width_px => out.* = t.width_px + 1,

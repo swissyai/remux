@@ -1,0 +1,5 @@
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -857,1 +857,1 @@
+-        .total_rows => out.* = t.screens.active.pages.total_rows,
++        .total_rows => out.* = t.screens.active.pages.total_rows + 1,

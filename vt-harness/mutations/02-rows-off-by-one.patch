@@ -1,0 +1,5 @@
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -835,1 +835,1 @@
+-        .rows => out.* = t.rows,
++        .rows => out.* = t.rows - 1,

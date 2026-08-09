@@ -2,7 +2,8 @@
 
 Rust terminal supervisor for running fleets of coding agents in one resident process.
 
-Std-only, zero third-party crates. Agent events arrive over a Unix socket the supervisor
+Product crates are std-only with zero third-party dependencies (the VT characterization
+harness additionally uses the MIT `libghostty-vt` bindings). Agent events arrive over a Unix socket the supervisor
 already owns — no per-event process forks. Most agent terminal workspaces fork a helper CLI
 on every tool call (measured at ~0.36s and 18MB per fork); at fleet scale that pattern turns
 into gigabytes of burst load. remux is built against that failure mode, with the benchmarks
@@ -35,6 +36,25 @@ reproduction command — run them through `scripts/with_scorer_lock.sh`.
   attestation overhead. The fork-per-event baseline measured 2.1GB resident for the same
   fleet size remux holds under 40MiB.
 
+## VT characterization harness
+
+`vt-harness/` pins the terminal-emulation core's behavior so any future change to the VT
+layer is gated by receipts, not trust: 425 table-driven characterization cases with
+full-state golden snapshots, 20 replayed byte-stream corpora (5.4MB, per-step state
+diffs), 120 adversarial malformed-input cases, 15 machine-checked invariants, an
+ABI-generic differential A/B runner with a seeded fuzzer (100k-execution smoke tier), and
+a planted-mutation gate: 14 committed behavioral mutations against a scratch build of the
+upstream source, all of which the harness must detect — a harness that cannot reject is
+not a gate. One command runs every tier and writes a machine-readable receipt:
+
+```sh
+GHOSTTY_SOURCE_DIR=/path/to/ghostty scripts/with_scorer_lock.sh scripts/score_vt1_01.sh
+```
+
+Requires Zig 0.15.2 and a Ghostty source checkout (MIT, © Mitchell Hashimoto and
+contributors) for the differential/mutation tiers; `cargo fetch` once for the harness's
+crates.io dependencies.
+
 ## Build
 
 ```sh
@@ -42,7 +62,8 @@ scripts/with_scorer_lock.sh cargo build --offline
 ```
 
 Workspace crates: `supervisor` (socket protocol, capability grants, attestation chain),
-`pty`, `bench`. No third-party dependencies; the offline Cargo configuration enforces it.
+`pty`, `bench`, `vt-harness`. Product crates carry no third-party dependencies; the
+harness declares its own (fetched once with `cargo fetch`).
 
 ## Status
 

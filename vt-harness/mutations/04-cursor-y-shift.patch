@@ -1,0 +1,5 @@
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -837,1 +837,1 @@
+-        .cursor_y => out.* = t.screens.active.cursor.y,
++        .cursor_y => out.* = (t.screens.active.cursor.y + 1) % t.rows,

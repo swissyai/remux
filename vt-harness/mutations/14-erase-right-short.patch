@@ -1,0 +1,5 @@
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -3084,1 +3084,1 @@
+-            break :right .{ x, self.cols };
++            break :right .{ x, self.cols - 1 };

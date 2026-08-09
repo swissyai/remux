@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Zig 0.15.2 cannot parse/link the macOS 26.5 Xcode SDK's libSystem stubs.
+# The installed Command Line Tools SDK remains compatible. Keep the compiler
+# pin exact, select that local SDK, and use libghostty-vt-sys's existing Darwin
+# target spelling for project artifacts. No source or expected value changes.
+set -euo pipefail
+REAL_ZIG="${VT1_REAL_ZIG:-$HOME/.local/bin/zig}"
+[ -x "$REAL_ZIG" ] || { echo "missing pinned Zig: $REAL_ZIG" >&2; exit 127; }
+
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+  [ -d /Library/Developer/CommandLineTools ] || {
+    echo "Zig 0.15.2 on macOS 26 requires the installed Command Line Tools SDK" >&2
+    exit 1
+  }
+  export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+  if [ "${1-}" = "build" ]; then
+    for argument in "$@"; do
+      case "$argument" in -Dtarget=*) exec "$REAL_ZIG" "$@" ;; esac
+    done
+    exec "$REAL_ZIG" "$@" -Dtarget=aarch64-macos-none
+  fi
+fi
+exec "$REAL_ZIG" "$@"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["bench", "pty", "supervisor"]
+members = ["bench", "pty", "supervisor", "vt-harness"]
 resolver = "2"
 
 [workspace.package]

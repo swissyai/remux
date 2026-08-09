@@ -1,0 +1,5 @@
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -3100,1 +3100,1 @@
+-        .complete => .{ 0, self.cols },
++        .complete => .{ 0, self.cols - 1 },

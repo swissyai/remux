@@ -1,0 +1,5 @@
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -858,1 +858,1 @@
+-        .scrollback_rows => out.* = t.screens.active.pages.total_rows - t.rows,
++        .scrollback_rows => out.* = t.screens.active.pages.total_rows - t.rows + 1,
